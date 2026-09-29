@@ -1,0 +1,141 @@
+:root {
+  --bg: #101418;
+  --panel: #1a2028;
+  --line: #2a323c;
+  --text: #d8dee6;
+  --muted: #7b8593;
+  --accent: #4da3ff;
+  --inbound: #35c26e;
+  --outbound: #e0a13c;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+header h1 { font-size: 16px; margin: 0; }
+.controls { display: flex; gap: 8px; align-items: center; }
+.controls button {
+  background: #243040;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.controls button:hover { background: #2d3b4e; }
+.chk { display: flex; gap: 4px; align-items: center; color: var(--muted); }
+#tick-label { color: var(--muted); min-width: 90px; text-align: right; }
+
+main {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  align-items: flex-start;
+}
+
+#map-wrap {
+  position: relative;
+  width: 800px;
+  height: 800px;
+  flex: none;
+  background: #0b0e12;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+#map-wrap canvas { position: absolute; inset: 0; }
+#cv-dynamic { cursor: crosshair; }
+
+#loading {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); background: rgba(11, 14, 18, 0.85);
+  font-size: 15px;
+}
+#loading.hidden { display: none; }
+
+#toast {
+  position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+  background: #3c2430; color: #ffb4c0;
+  border: 1px solid #6e3a4a; border-radius: 4px;
+  padding: 6px 14px; font-size: 12px;
+  transition: opacity 0.3s;
+}
+#toast.hidden { opacity: 0; pointer-events: none; }
+
+aside {
+  flex: 1;
+  min-width: 300px;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+section h2 {
+  font-size: 13px; margin: 0 0 8px;
+  color: var(--muted); font-weight: 600;
+  display: flex; justify-content: space-between; align-items: center;
+}
+section h2 button {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+}
+section h3 { font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.metric { text-align: center; }
+.metric span { font-size: 16px; font-weight: 600; display: block; }
+.metric label { font-size: 11px; color: var(--muted); }
+#m-collision.ok { color: var(--inbound); }
+#m-stall.hot, #m-wait.hot { color: #ffb04d; }
+
+#load-stats { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+#vehicle-info { font-size: 12px; white-space: pre-line; }
+.hidden { display: none !important; }
+
+#event-log {
+  max-height: 150px;
+  overflow-y: auto;
+  font-size: 11px;
+  color: var(--muted);
+}
+.evt { padding: 1px 0; border-bottom: 1px dashed #20262e; }
+.evt b { color: var(--accent); font-weight: 500; }
+.evt.muted { border: none; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 11px; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.lg { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }
+.lg.slot { background: #232c38; border: 1px solid #33404f; }
+.lg.tote { background: rgba(240, 200, 90, 0.45); }
+.lg.veh { background: #4da3ff; border-radius: 50%; }
+.lg.waiting { background: #ffb04d; border-radius: 50%; }
+.lg.stalled { background: #ff5d5d; border-radius: 50%; }
+.lg.obstacle { background: #000; border: 1px solid #555; }
+.lg.wall { background: #39434f; border: 1px solid #4d5a6b; }
+.lg.inbound { background: rgba(53, 194, 110, 0.4); }
+.lg.outbound { background: rgba(224, 161, 60, 0.4); }
+.hint { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
