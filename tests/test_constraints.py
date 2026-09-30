@@ -385,3 +385,24 @@ def test_recommended_piles_within_capacity():
     # 单桩真实速率必须低于 容量/充满时长（只充 20%→满 跨度）
     assert cfg.charge_rate_per_tick() * cfg.TICK_RATE \
         < cfg.BATTERY_FULL / cfg.CHARGE_SECONDS
+
+
+def test_charge_wave_stress_queue_cell_exclusive(small_engine):
+    """D14 回归（低电量波峰压力）：任一排队格至多被一台车认作目标。
+
+    缺陷现场：assign_queue_cell 只查物理占用不查他车目标，N 台车同指一个
+    排队格在入口串线互堵；此处把初始电量压至 30–60% 制造同步充电波峰，
+    每 100 tick 抽样断言排队格目标互斥 + 队列条目唯一。
+    """
+    e = small_engine
+    for v in e.vehicles.values():
+        v.battery = cfg.BATTERY_FULL * (0.3 + 0.3 * ((v.id * 7) % 10) / 10)
+    for _ in range(12):
+        run(e, 100)
+        qcells = set(e.grid.charging.queue_cells)
+        targets = [v.charge_target for v in e.vehicles.values()
+                   if v.charge_target in qcells]
+        assert len(targets) == len(set(targets)), \
+            f"tick {e.tick_n}: 排队格被多车同指 {sorted(targets)}"
+        q = e.grid.charging.queue
+        assert len(q) == len(set(q)), f"tick {e.tick_n}: 队列条目重复"

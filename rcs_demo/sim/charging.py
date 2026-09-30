@@ -42,15 +42,6 @@ class ChargingManager:
             self.area.queue.append(vid)
             self.events.append(("charge_queued", vid))
 
-    def dequeue_for_pile(self, batteries: dict[int, float]) -> tuple[int, Cell] | None:
-        """桩空出时取队首：电量更低者优先（FR-026）。"""
-        pile = self.free_pile()
-        if pile is None or not self.area.queue:
-            return None
-        best = min(self.area.queue, key=lambda v: batteries.get(v, 0.0))
-        self.area.queue.remove(best)
-        return best, pile
-
     def assign_queue_cell(self, vehicle: Vehicle, taken: set[Cell]) -> Cell | None:
         """为排队车分配一个空闲排队格。"""
         for cell in self.area.queue_cells:

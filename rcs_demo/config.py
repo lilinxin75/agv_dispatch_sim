@@ -99,6 +99,14 @@ CONFLICT_MIN_TICKS = int(_env("CONFLICT_MIN_TICKS", 3, int))  # 互堵持续 tic
 # 互堵判定中"阻挡车未推进"的判 stall 阈值（002 口径修正）：载货+转弯 legit 速度
 # 0.35 格/tick（合法慢速），阻挡车 ≥4 tick 无位移才视为真阻挡，否则视为正常跟车
 CONFLICT_BLOCK_TICKS = int(_env("CONFLICT_BLOCK_TICKS", 4, int))
+
+# ---- 充电行程治理（002 D14，tick-9600 解剖）----
+# 在途充电行程上限（waiting-room 限流）：TO_CHARGE 旅行者达上限时不再新发桩
+# 行程，改排队等待——防止充电波峰时全队涌向充电区、西入口走廊物理堵死
+CHARGE_TRIP_CAP = int(_env("CHARGE_TRIP_CAP", 8, int))
+# 桩认领滞留释放阈值：TO_CHARGE 认领桩后超过该 tick 数无位移 → 释放认领回
+# 队列（防"旅行者堵在半路、桩被认领泄漏、队列无可服务桩"的占用泄漏）
+CHARGE_CLAIM_STALL_TICKS = int(_env("CHARGE_CLAIM_STALL_TICKS", 300, int))
 CONFLICT_LOG_DIR = os.environ.get("RCS_CONFLICT_LOG_DIR", "logs")
 CONFLICT_OPTIMIZATION = os.environ.get("RCS_CONFLICT_OPTIMIZATION", "1") == "1"  # FR-024 热点加权
 

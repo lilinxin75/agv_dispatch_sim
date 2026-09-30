@@ -68,8 +68,14 @@ def _anomaly_check(win: int, wall: float, done_delta: int, zero_streak: dict,
 
 
 def run(ticks: int, seed: int, report_dir: str, log_dir: str | None,
-        verbose: bool = True) -> int:
-    e = Engine(seed=seed, conflict_log_dir=log_dir)
+        verbose: bool = True, layout: str | None = None) -> int:
+    # 布局预设（SC-004 对比口径）：None → baseline 缺省
+    if layout is not None and layout != "baseline":
+        from .sim.grid import load_profile
+        e = Engine(seed=seed, conflict_log_dir=log_dir,
+                   layout=load_profile(layout))
+    else:
+        e = Engine(seed=seed, conflict_log_dir=log_dir)
     rpt = Path(report_dir)
     rpt.mkdir(parents=True, exist_ok=True)
     marks_fh = open(rpt / "marks.jsonl", "w", encoding="utf-8")
@@ -162,13 +168,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--report-dir", default="logs/acceptance")
     ap.add_argument("--conflict-log-dir", default=None)
+    ap.add_argument("--layout", default=None,
+                    help="布局预设（baseline/wide-oneway/charge-expanded）")
     args = ap.parse_args(argv)
     errs = cfg.validate()
     if errs:
         print("配置校验失败:", "; ".join(errs), file=sys.stderr)
         return 1
     return run(args.ticks, args.seed, args.report_dir,
-               args.conflict_log_dir or str(Path(args.report_dir) / "conflicts"))
+               args.conflict_log_dir or str(Path(args.report_dir) / "conflicts"),
+               layout=args.layout)
 
 
 if __name__ == "__main__":

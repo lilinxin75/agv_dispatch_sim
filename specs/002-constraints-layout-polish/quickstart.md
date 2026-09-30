@@ -53,6 +53,7 @@ python3 -m rcs_demo.acceptance --ticks 8000 --report-dir logs/acc_smoke
 
 ```bash
 python3 -m rcs_demo.acceptance --ticks 36000 --seed 42 --report-dir logs/acc_final
+# 布局对比口径（SC-004）：--layout wide-oneway / --layout charge-expanded
 ```
 
 核对双口径（summary.json / 控制台摘要）：

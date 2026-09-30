@@ -594,32 +594,43 @@ class Engine:
         # 失败 → 回退排队分支。此前失败即返回不排队——约 100 台低电车每冷却窗
         # 重试同一不可达桩，1500 tick 内 4.1 万次调用、烧 8200 万 A* 节点
         r0, c0 = v.cell
-        free_piles = sorted(
-            (p for p, o in self.grid.charging.pile_owner.items() if o is None),
-            key=lambda p: abs(p[0] - r0) + abs(p[1] - c0))[:2]
+        # waiting-room 限流（D14）：在途旅行者达上限直接走排队分支——
+        # 波峰时全队涌向充电区会把西入口走廊物理堵死（实测不可达分量扩散）
         planned = False
-        for pile in free_piles:
-            if pile in self.occupant and self.occupant[pile] != v.id:
-                continue  # 充电位被滞留车物理占据
-            path = self.planner.plan_any_dir(v.cell, pile, False,
-                                             self.occupied_by_others(v.id),
-                                             max_nodes=3_000)
-            if path is None:
-                continue  # 暂不可达：换桩/回退排队，冷却后重试
-            self.area_claim_pile(pile, v.id)
-            v.state = VehicleState.TO_CHARGE
-            v.charge_target = pile
-            v.path = path
-            changed_v.add(v.id)
-            planned = True
-            break
+        if self._charge_trip_count() < cfg.CHARGE_TRIP_CAP:
+            free_piles = sorted(
+                (p for p, o in self.grid.charging.pile_owner.items()
+                 if o is None),
+                key=lambda p: abs(p[0] - r0) + abs(p[1] - c0))[:2]
+            for pile in free_piles:
+                if pile in self.occupant and self.occupant[pile] != v.id:
+                    continue  # 充电位被滞留车物理占据
+                path = self.planner.plan_any_dir(v.cell, pile, False,
+                                                 self.occupied_by_others(v.id),
+                                                 max_nodes=3_000)
+                if path is None:
+                    continue  # 暂不可达：换桩/回退排队，冷却后重试
+                self.area_claim_pile(pile, v.id)
+                v.state = VehicleState.TO_CHARGE
+                v.charge_target = pile
+                v.path = path
+                v.last_move_tick = self.tick_n  # 滞留释放时钟起点（D14）
+                changed_v.add(v.id)
+                planned = True
+                break
         if planned:
             return
         # 桩满/不可达 → 排队格等待（电量更低者优先出队）。必须规划到排队格的
         # 实际路径并成功后才入队——只设 charge_target 不规划路径会让车原地成
         # to_charge 僵尸、自愈回 idle 后队列条目残留（排队深度失真 → 错峰失效）
-        target = self.charging.assign_queue_cell(
-            v, set(self.occupant) - {v.cell})
+        # 002 FR-027 第二轮解剖：分配互斥不仅要查物理占用，还要查他车已认准
+        # 的排队格目标——否则 N 台车同指一个格，在入口排成一串互堵（实测
+        # 8 台车目标同指 (189,85)）
+        taken = set(self.occupant) - {v.cell}
+        taken |= {o.charge_target for o in self.vehicles.values()
+                  if o is not v
+                  and o.charge_target in self.grid.charging.queue_cells}
+        target = self.charging.assign_queue_cell(v, taken)
         if target is None:
             return  # 排队格也满：留在原地稍后再试
         path = self.planner.plan_any_dir(v.cell, target, False,
@@ -683,52 +694,100 @@ class Engine:
                 events.append({"kind": "charge_done", "vehicle_id": v.id})
                 changed_v.add(v.id)
 
+    def _charge_trip_count(self) -> int:
+        """当前在途充电行程数（TO_CHARGE 旅行者，waiting-room 限流用，D14）。"""
+        return sum(1 for v in self.vehicles.values()
+                   if v.state is VehicleState.TO_CHARGE)
+
+    def _release_stale_charge_claims(self, changed_v: set[int]):
+        """桩认领泄漏治理（D14，tick-9600 解剖）。
+
+        TO_CHARGE 旅行者认领桩后因走廊拥塞滞留超阈值（无位移）→ 释放认领、
+        清目标/路径回 IDLE 并重新入队。否则：旅行者堵在半路、桩被认领泄漏
+        （实测 10 桩 5 桩被非充电车挂名）、队列无可服务桩，系统整体卡死。
+        排队格等待（charge_target 为排队格）不受影响——那是合法波尾等待。
+        """
+        for v in self.vehicles.values():
+            if (v.state is VehicleState.TO_CHARGE
+                    and v.charge_target in self.grid.charging.pile_owner
+                    and v.id not in self.grid.charging.queue
+                    and self.tick_n - v.last_move_tick
+                    > cfg.CHARGE_CLAIM_STALL_TICKS):
+                self._release_pile_claim(v)
+                v.charge_target = None
+                v.path = []
+                v.state = VehicleState.IDLE
+                v.prev_state = None
+                self.charging.enqueue(v.id, v.battery)
+                changed_v.add(v.id)
+
     def _charge_queue_scheduling(self, changed_v: set[int], events: list[dict]):
-        # 002 FR-027 监控发现（tick ~4300 现场解剖：9 个空闲桩 0 台在充、20 台
-        # 滞零饿死）：原实现队首出队失败即 break——队首恰是最缺电（滞零、离桩
-        # 远、规划必败）的车，10-tick 冷却内整条队列停摆，空闲桩无人充电。
-        # 修复：失败者移队尾并继续试下一个候选（电量更低者优先出队不变，
-        # 但失败不再阻塞队伍）；每 tick 至多 3 次出队尝试限规划成本
+        # 002 FR-027 第二轮解剖（tick 20400 现场：10 桩全空、4 台滞零车堵死
+        # 排队线、done 掉到 5/窗）定位三个叠加缺陷：
+        #   ① min-battery 首选出队 + 前车物理阻挡 → 首选规划必败进冷却，
+        #      队列整线停摆（队首高电量车挡路却永不出队）；
+        #   ② free_pile() 返回第一座未认领桩，被滞留车物理占据时全队列停摆
+        #      （其余空桩无人服务）；
+        #   ③ 队列失败烧光每 tick 尝试预算，空闲车直发循环永远轮不到。
+        # 修复：物理空闲桩中就近选位；按电量升序逐个候选试规划，失败者冷却
+        # 并跳过（不阻塞后续候选）；队列服务与空闲直发各自独立预算。
+        queue = self.grid.charging.queue
+        self._release_stale_charge_claims(changed_v)
         attempts = 0
-        while attempts < 3:
-            got = self.charging.dequeue_for_pile(
-                {v.id: v.battery for v in self.vehicles.values()})
-            if got is None:
+        while attempts < 2 and queue:
+            # waiting-room 限流（D14）：在途旅行者达上限不再新发行程，
+            # 队列中的车原地等待（波峰时防充电区入口走廊物理堵死）
+            if self._charge_trip_count() >= cfg.CHARGE_TRIP_CAP:
                 break
-            vid, pile = got
-            v = self.vehicles.get(vid)
-            if v is None or not v.need_charge or v.state == VehicleState.CHARGING:
-                continue  # 失效条目：丢弃，不占尝试配额
-            # 充电位仍被滞留车物理占据（充满未驶离）→ 暂缓分配，防其堵在桩旁
-            if pile in self.occupant and self.occupant[pile] != vid:
-                self.charging.area.queue.insert(0, vid)
+            free = [p for p, o in self.grid.charging.pile_owner.items()
+                    if o is None and p not in self.occupant]
+            if not free:
                 break
-            attempts += 1
-            # 规划冷却（002 性能修复）：失败车 10 tick 内不反复规划（拥塞下
-            # 不可达充电行程的 A* 代价极高）——移队尾，不阻塞后续候选
-            if self.tick_n - self._charge_retry_tick.get(vid, -10**9) < 10:
-                self.charging.area.queue.append(vid)
-                continue
-            # 先释放该车此前认领的充电位（防重复认领）
-            self._release_pile_claim(v)
-            path = self.planner.plan_any_dir(v.cell, pile, False,
-                                             self.occupied_by_others(v.id),
-                                             max_nodes=20_000)
-            if path is None:
-                self.charging.area.queue.append(vid)  # 暂不可达：移队尾
-                self._charge_retry_tick[vid] = self.tick_n
-                continue
-            self.area_claim_pile(pile, vid)
-            v.charge_target = pile
-            v.state = VehicleState.TO_CHARGE
-            v.prev_state = None
-            v.path = path
-            changed_v.add(v.id)
+            batteries = {o.id: o.battery for o in self.vehicles.values()}
+            served = False
+            for vid in sorted(queue, key=lambda q: batteries.get(q, 0.0)):
+                v = self.vehicles.get(vid)
+                if v is None or not v.need_charge \
+                        or v.state is VehicleState.CHARGING:
+                    queue.remove(vid)  # 失效条目：丢弃，不占尝试配额
+                    continue
+                # 规划冷却（002 性能修复）：失败车 10 tick 内不反复规划——
+                # 本 tick 跳过该车继续试下一位，不再阻塞整队
+                if self.tick_n - self._charge_retry_tick.get(vid, -10**9) < 10:
+                    continue
+                r, c = v.cell
+                pile = min(free, key=lambda p: abs(p[0] - r) + abs(p[1] - c))
+                # 排队格→桩行程仅 ~10-30 步：上限 6k 只在规划失败时生效，
+                # 失败止损比 20k 快 3 倍（profile 实测队列规划占 tick 成本过半）
+                path = self.planner.plan_any_dir(v.cell, pile, False,
+                                                 self.occupied_by_others(v.id),
+                                                 max_nodes=6_000)
+                if path is None:
+                    self._charge_retry_tick[vid] = self.tick_n
+                    continue  # 暂不可达：冷却，试下一位
+                self._release_pile_claim(v)  # 防重复认领
+                self.area_claim_pile(pile, vid)
+                v.charge_target = pile
+                v.state = VehicleState.TO_CHARGE
+                v.prev_state = None
+                v.path = path
+                v.last_move_tick = self.tick_n  # 滞留释放时钟起点（D14）
+                queue.remove(vid)
+                changed_v.add(v.id)
+                attempts += 1
+                served = True
+                break
+            if not served:
+                break  # 本 tick 无候选可服务（全冷却/全失败）
         # ---- 空闲车直发（002 FR-027 补充）：队列服务完仍有空闲桩时，按电量
         # 升序为未入队的 need_charge 闲车直接规划去桩行程——此前该路径走
         # _need_charge_flags（tick 末段），预算已被任务规划吃穿，其充电尝试
-        # 永远拿不到规划资源（车辆 72 滞零 2400+ tick 的根因）
-        while attempts < 3:
+        # 永远拿不到规划资源（车辆 72 滞零 2400+ tick 的根因）。
+        # 独立预算（defect ③）：队列规划失败不再挤占直发机会
+        idle_attempts = 0
+        while idle_attempts < 2:
+            if self._charge_trip_count() >= cfg.CHARGE_TRIP_CAP:
+                break  # waiting-room 限流（D14）
             free = [p for p, o in self.grid.charging.pile_owner.items()
                     if o is None and p not in self.occupant]
             if not free:
@@ -756,9 +815,10 @@ class Engine:
             c.state = VehicleState.TO_CHARGE
             c.prev_state = None
             c.path = path
+            c.last_move_tick = self.tick_n  # 滞留释放时钟起点（D14）
             c.defer_charge = False
             changed_v.add(c.id)
-            attempts += 1
+            idle_attempts += 1
 
     # ---- 料箱循环（FR-018）----
 

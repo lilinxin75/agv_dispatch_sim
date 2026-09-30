@@ -82,6 +82,8 @@ API 端口可绑定，输出 `OK: grid layout / planner / engine self-test passe
 | `RCS_REASSIGN_TICKS` | 300 | 任务无进度改派阈值（tick） |
 | `RCS_STATION_CAPACITY` | 6 | 工作站同时在场车辆上限 |
 | `RCS_CHARGE_QUEUE_SOFT_LIMIT` | 6 | 充电排队深度软上限（超过触发错峰延迟） |
+| `RCS_CHARGE_TRIP_CAP` | 8 | 在途充电行程上限（waiting-room 限流，防充电区入口走廊堵死，research.md D14） |
+| `RCS_CHARGE_CLAIM_STALL_TICKS` | 300 | 充电位认领滞留释放阈值（旅行者滞留超时释放认领回队列，D14） |
 | `RCS_GOVERN_BACKPRESSURE` / `RCS_GOVERN_REASSIGN` / `RCS_GOVERN_CHARGE_DEFER` | 1 | 拥塞治理组合开关（背压/改派/错峰，可独立关闭对比） |
 | `RCS_TRAIL_TTL_TICKS` | 30 | 轨迹消失时长（tick，≈3 秒） |
 | `RCS_TURN_PENALTY` | 3 | 每次转向的路径代价惩罚（软约束） |
