@@ -67,10 +67,10 @@ Technical Context 无 NEEDS CLARIFICATION 项；以下为关键技术决策的�
 
 ## R7. 验证环境（docker rcs_core_dev）
 
-**Decision**: 仿真本体为纯 Python + 浏览器，可在宿主机直接运行；容器内验证步骤写入 quickstart：
-`docker exec -it cuda12_8_torch_2_9_1_core_dev bash -c "cd /home/dev/workspace/binglee/rcs_demo && ..."`
+**Decision**: 仿真本体为纯 Python + 浏览器，开发、测试与运行统一在容器内进行（2026-09-30 规格澄清：宿主机不作为运行环境）；容器内执行步骤写入 quickstart：
+`docker exec -it rcs_core_dev bash -c "cd /home/dev/workspace/binglee/rcs_demo && ..."`
 （host 网络模式，容器内启动的端口宿主机直接可访问）。
-- **Rationale**: 容器为 host 网络，演示服务在容器内启动即可从宿主机浏览器访问；`--check` 自检不依赖 GPU/ROS，任何环境可跑。
+- **Rationale**: 容器为 host 网络，演示服务在容器内启动即可从宿主机浏览器访问；`--check` 自检不依赖 GPU/ROS，容器内直接可跑。
 
 ## R8. 测试策略
 

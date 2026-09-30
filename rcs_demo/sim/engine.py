@@ -401,6 +401,9 @@ class Engine:
     def _start_charge_trip(self, v: Vehicle, changed_v: set[int],
                            events: list[dict]):
         pile = self.charging.free_pile()
+        if (pile is not None and pile in self.occupant
+                and self.occupant[pile] != v.id):
+            pile = None  # 充电位被滞留车物理占据：按无空桩处理（进排队）
         if pile is None:
             # 桩满 → 排队格等待（电量更低者优先出队）
             target = self.charging.assign_queue_cell(
@@ -457,6 +460,7 @@ class Engine:
                     self.grid.charging.pile_owner[pile] = None
                 v.need_charge = False
                 v.charge_target = None
+                v.prev_state = None  # 充电周期闭环：不得让残留 prev_state 复活
                 v.state = VehicleState.IDLE
                 events.append({"kind": "charge_done", "vehicle_id": v.id})
                 changed_v.add(v.id)
@@ -471,6 +475,10 @@ class Engine:
             v = self.vehicles.get(vid)
             if v is None or not v.need_charge or v.state == VehicleState.CHARGING:
                 continue
+            # 充电位仍被滞留车物理占据（充满未驶离）→ 暂缓分配，防其堵在桩旁
+            if pile in self.occupant and self.occupant[pile] != vid:
+                self.charging.area.queue.insert(0, vid)
+                break
             # 先释放该车此前认领的充电位（防重复认领）
             self._release_pile_claim(v)
             path = self.planner.plan_any_dir(v.cell, pile, False,
@@ -543,6 +551,17 @@ class Engine:
                 v.state = VehicleState.IDLE
                 v.prev_state = None
                 changed_v.add(v.id)
+            # TO_CHARGE 僵尸自愈（缩尺烟测车辆 10 定位）：无路径、不在充电位/
+            # 排队格 → 回 idle（若仍需充电由临界清扫重新发起）。否则车辆永久
+            # 卡在 to_charge：不可派单、不再移动、电量冻结（prev_state 复活所致）
+            if (v.state == VehicleState.TO_CHARGE and not v.path
+                    and not self.charging.at_pile(v)
+                    and v.cell not in self.grid.charging.queue_cells):
+                self._release_pile_claim(v)
+                v.state = VehicleState.IDLE
+                v.prev_state = None
+                v.charge_target = None
+                changed_v.add(v.id)
             # 不变量自愈：idle 车不应携带料箱
             if v.state == VehicleState.IDLE and v.carrying is not None:
                 if v.task is not None and v.task.state == TaskState.IN_PROGRESS:
@@ -552,11 +571,17 @@ class Engine:
                 changed_v.add(v.id)
             # FR-028 待命靠边：idle 车停在通道上会堵窄道 → 主动挪到最近空点位格
             # （无载车可停在静置料箱格下方，FR-015；让出 1 格宽通道减少死锁）
-            if (v.state == VehicleState.IDLE and not v.path
-                    and v.cell not in self._parked_ok
-                    and self.grid.kind.get(v.cell) == CellKind.FLOOR
-                    and not self.grid.in_charging_area(v.cell)):
-                self._try_park_aside(v, changed_v)
+            # 澄清 2026-09-30：①入库/出库工作站放置位不得驻留空闲车——否则后续
+            # 送货车被堵成片 stalled；②充电区内滞留的 idle 车（充满未驶离）
+            # MUST 立即驶离——否则充电位被白占，后续充电车全堵在桩旁
+            if v.state == VehicleState.IDLE and not v.path \
+                    and v.cell not in self._parked_ok:
+                if self.grid.in_charging_area(v.cell):
+                    self._exit_charging(v, changed_v)
+                elif self.grid.kind.get(v.cell) in (CellKind.FLOOR,
+                                                    CellKind.INBOUND,
+                                                    CellKind.OUTBOUND):
+                    self._try_park_aside(v, changed_v)
 
     def _drop_tote_here(self, v: Vehicle) -> bool:
         """就地落箱（料箱落于当前格，变为静置）。"""
@@ -573,12 +598,75 @@ class Engine:
         v.carrying = None
         return True
 
+    def _exit_charging(self, v: Vehicle, changed_v: set[int]):
+        """滞留充电区的 idle 车就近驶离（澄清 2026-09-30：充满后不得滞留充电位）。
+
+        一段直达：目标即空闲存储点位（就近 + 分散选点，避开他车让路目标），
+        到达即完成 FR-028 靠边待命并恢复可派；避免「先出区再靠边」两段
+        MAKING_WAY 挤占可派时间（缩尺均匀性烟测曾因此超界）。
+        """
+        if self.tick_n - self._park_try_tick.get(v.id, -10**9) < 30:
+            return
+        self._park_try_tick[v.id] = self.tick_n
+        for best in self._pick_parking_slots(v):
+            path = self.planner.plan_any_dir(v.cell, best, False,
+                                             self.occupied_by_others(v.id),
+                                             max_nodes=30_000)
+            if path:
+                v.state = VehicleState.MAKING_WAY
+                v.way_target = best
+                v.prev_state = None  # 靠边停靠后应回 idle，不复活旧状态
+                self._parked_ok.discard(v.cell)
+                v.path = path
+                changed_v.add(v.id)
+                return
+
+    def _pick_parking_slots(self, v: Vehicle, k: int = 20) -> list[Cell]:
+        """就近 + 分散选点（澄清 2026-09-30 选项 A，FR-028）。
+
+        从最近 K 个空闲储位中，优先选与其它停靠车（idle 车当前位置 +
+        他车让路目标）间距最大者，平局取更近者——兼顾短挪车与散开，
+        避免疏散车流在站点/充电区附近的储位扎堆。
+        """
+        r, c = v.cell
+        taken = {o.way_target for o in self.vehicles.values()
+                 if o.id != v.id and o.way_target is not None}
+        parked = {o.cell for o in self.vehicles.values()
+                  if o.id != v.id and o.state == VehicleState.IDLE} | taken
+        cands = sorted(
+            (s for s in self.grid.slots
+             if s not in self.occupant and s not in taken
+             and s not in self.grid.blocked and s not in self.docked_cells),
+            key=lambda s: abs(s[0] - r) + abs(s[1] - c))[:k]
+        if not parked or len(cands) < 2:
+            return cands
+        def score(s):
+            spread = min(abs(s[0] - pr) + abs(s[1] - pc) for pr, pc in parked)
+            return (-spread, abs(s[0] - r) + abs(s[1] - c))
+        return sorted(cands, key=score)
+
     def _try_park_aside(self, v: Vehicle, changed_v: set[int]):
-        """空闲车就近挪到存储点位格待命（不占通道，FR-028 靠边待命）。"""
+        """空闲车就近挪到存储点位格待命（不占通道/工作站，FR-028 靠边待命）。"""
         if self.tick_n - self._park_try_tick.get(v.id, -10**9) < 30:
             return  # 冷却，防反复尝试
         self._park_try_tick[v.id] = self.tick_n
         r, c = v.cell
+        k = self.grid.kind.get(v.cell)
+        if k in (CellKind.INBOUND, CellKind.OUTBOUND):
+            # 工作站放置位：半径搜索必然失败（附近无点位）→ 全局疏散，
+            # 选点用「就近 + 分散」（_pick_parking_slots，澄清 2026-09-30 选项 A）
+            for best in self._pick_parking_slots(v):
+                path = self.planner.plan(v.cell, best, v.facing, False,
+                                         self.occupied_by_others(v.id),
+                                         max_nodes=30_000)
+                if path:
+                    v.state = VehicleState.MAKING_WAY
+                    v.way_target = best
+                    v.prev_state = None  # 靠边停靠后应回 idle，不复活旧状态
+                    v.path = path
+                    changed_v.add(v.id)
+                    return
+            return
         for radius in (1, 2, 3):
             best = None
             for dr in range(-radius, radius + 1):

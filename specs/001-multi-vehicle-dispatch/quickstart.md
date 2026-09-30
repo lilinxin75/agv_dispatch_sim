@@ -4,7 +4,7 @@ Date: 2026-09-29 | Feature: 001-multi-vehicle-dispatch
 
 ## 前置条件
 
-- Python 3.10+（宿主机或 docker 容器 rcs_core_dev 内均可；容器为 host 网络，端口直通）
+- Python 3.10+（开发、测试、运行统一在 docker 容器 rcs_core_dev 内进行；容器为 host 网络，端口直通）
 - 现代桌面浏览器（Chrome/Edge/Firefox）
 
 ## 启动（3 条命令内）
@@ -62,7 +62,7 @@ pytest tests/ -q
 ## 容器内验证（rcs_core_dev）
 
 ```bash
-docker exec -it cuda12_8_torch_2_9_1_core_dev \
+docker exec -it rcs_core_dev \
   bash -c "cd /home/dev/workspace/binglee/rcs_demo && pip install -r requirements.txt && python -m rcs_demo --check"
 # 容器内启动服务后，宿主机浏览器访问 http://localhost:8000（host 网络直通）
 ```

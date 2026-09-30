@@ -145,9 +145,12 @@ function render() {
   const r0 = Math.max(0, Math.floor(wy0 / CELL) - 1), r1 = Math.min(GRID - 1, Math.ceil(wy1 / CELL) + 1);
   const c0 = Math.max(0, Math.floor(wx0 / CELL) - 1), c1 = Math.min(GRID - 1, Math.ceil(wx1 / CELL) + 1);
 
-  // 轨迹尾迹（FR-032）：每车最近 N tick 移动路径，半透明渐隐，绘制在小车层之下
+  // 轨迹尾迹（FR-032）：每车最近 N tick 移动路径，半透明渐隐，绘制在小车层之下。
+  // 性能：按 alpha 分 4 档归并为 4 条路径描边（逐段 beginPath/stroke 在
+  // 100 车 × 30 段时约 3000 次调用/帧，是初始化阶段卡顿的主因之一）。
   if (showTrails) {
-    ctxD.lineWidth = Math.max(1, 1.5 / cam.scale);
+    const BUCKETS = 4;
+    const paths = Array.from({ length: BUCKETS }, () => new Path2D());
     for (const v of vehicleVis.values()) {
       const tr = v.trail;
       if (!tr || tr.length < 2) continue;
@@ -155,12 +158,15 @@ function render() {
           tr[tr.length - 1].y < r0 - 2 || tr[tr.length - 1].y > r1 + 2) continue;
       const n = tr.length;
       for (let i = 1; i < n; i++) {
-        ctxD.strokeStyle = `rgba(140,180,255,${(i / n) * 0.30})`;
-        ctxD.beginPath();
-        ctxD.moveTo(tr[i - 1].x * CELL + CELL / 2, tr[i - 1].y * CELL + CELL / 2);
-        ctxD.lineTo(tr[i].x * CELL + CELL / 2, tr[i].y * CELL + CELL / 2);
-        ctxD.stroke();
+        const b = Math.min(BUCKETS - 1, Math.floor((i / n) * BUCKETS));
+        paths[b].moveTo(tr[i - 1].x * CELL + CELL / 2, tr[i - 1].y * CELL + CELL / 2);
+        paths[b].lineTo(tr[i].x * CELL + CELL / 2, tr[i].y * CELL + CELL / 2);
       }
+    }
+    ctxD.lineWidth = Math.max(1, 1.5 / cam.scale);
+    for (let b = 0; b < BUCKETS; b++) {
+      ctxD.strokeStyle = `rgba(140,180,255,${((b + 1) / BUCKETS) * 0.30})`;
+      ctxD.stroke(paths[b]);
     }
   }
 
@@ -328,7 +334,7 @@ function applySnapshot(m) {
   vehicleVis.clear();
   for (const v of m.vehicles) {
     vehicleVis.set(v.id, { x: v.cell[1], y: v.cell[0], tx: v.cell[1], ty: v.cell[0],
-      trail: [{ x: v.cell[1], y: v.cell[0] }],
+      trail: [{ x: v.cell[1], y: v.cell[0], t: m.tick }],
       state: v.state, battery: v.battery, completed: v.completed,
       carrying: carriedTotes.has(v.id) });
   }
@@ -344,15 +350,27 @@ function applyDelta(m) {
     if (!v) { v = { x: dv.to[1], y: dv.to[0], tx: dv.to[1], ty: dv.to[0], trail: [] }; vehicleVis.set(dv.id, v); }
     v.tx = dv.to[1]; v.ty = dv.to[0];
     if (v.x === undefined || Math.abs(v.x - v.tx) + Math.abs(v.y - v.ty) > 3) { v.x = dv.from[1]; v.y = dv.from[0]; }
-    // 轨迹采样（FR-032）：每 tick 到达格入队，超出 TRAIL_LEN 丢弃最旧
+    // 轨迹采样（FR-032）：每 tick 到达格入队（带服务端 tick 时间戳）。
+    // 双重淘汰：① 超出 TRAIL_LEN 点数丢最旧（行走刷新）；② 点位年龄超
+    // TRAIL_LEN tick 蒸发（停顿渐消，见 applyDelta 末尾的老化扫描）。
+    // 跳变保护：两次增量之间若推进了多格（tick 偶发变慢/标签后台节流/网络抖动），
+    // 中间路径数据缺失，直接连线会画出横穿地图的假轨迹 —— 清空重记。
     if (!v.trail) v.trail = [];
     const last = v.trail[v.trail.length - 1];
-    if (!last || last.x !== v.tx || last.y !== v.ty) {
-      v.trail.push({ x: v.tx, y: v.ty });
+    if (last && Math.abs(v.tx - last.x) + Math.abs(v.ty - last.y) > 1) v.trail = [];
+    else if (!last || last.x !== v.tx || last.y !== v.ty) {
+      v.trail.push({ x: v.tx, y: v.ty, t: m.tick });
       if (v.trail.length > TRAIL_LEN) v.trail.shift();
     }
     v.state = dv.state;
     if (dv.battery !== undefined) v.battery = dv.battery;
+  }
+  // 轨迹老化（FR-032 停顿渐消）：每 tick 对全部车辆扫描，按点位记录时间
+  // 淘汰过期点——停下的车尾迹从远端逐渐缩短直至消失（点位按 tick 单调，
+  // while-shift 无分配开销）
+  for (const v of vehicleVis.values()) {
+    const tr = v.trail;
+    while (tr && tr.length && m.tick - tr[0].t > TRAIL_LEN) tr.shift();
   }
   for (const dt of m.totes) {
     if (dt.state === "docked" && Array.isArray(dt.at)) {

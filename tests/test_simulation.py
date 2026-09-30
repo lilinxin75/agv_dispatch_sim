@@ -46,7 +46,7 @@ def test_assignment_uniformity(small_engine):
     # least-loaded 语义抽检：任意时刻空闲可派车辆中，已分配最少者优先由实现保证
     cands = e.dispatcher.assignable_vehicles(e.vehicles)
     if cands:
-        base = e.vehicles[cands[0]].assigned_count
+        base = cands[0].assigned_count  # assignable_vehicles 返回 Vehicle 对象
         assert base <= max(v.assigned_count for v in e.vehicles.values())
 
 

@@ -7,6 +7,8 @@
 
 ## 启动（3 条命令内）
 
+开发、测试、运行统一在 docker 容器 **rcs_core_dev** 内进行（宿主机仅浏览器访问，host 网络直通）。
+
 ```bash
 pip install -r requirements.txt
 python -m rcs_demo            # 默认 0.0.0.0:8000，--port 改端口
@@ -43,6 +45,8 @@ API 端口可绑定，输出 `OK: grid layout / planner / engine self-test passe
   30 秒充满返回；无电量耗尽停摆
 - **视口缩放平移**：滚轮以光标为锚缩放 0.25×–4×，拖拽平移（与点击智能区分，无需切换模式），
   一键复位整图
+- **移动轨迹尾迹**：每车最近 30 tick 半透明渐隐尾迹（工具栏「轨迹」开关）；
+  位置跳变（数据缺口）自动断开不连线，绘制按透明度分桶批量描边
 - **指标面板**：完成任务数、等待/受阻车辆数、碰撞计数（恒 0）、充电中/排队数、
   平均电量、各车完成数分布
 - **冲突事件记录分析（面向开发迭代）**：≥2 台车成团互堵判定为一次事件，
@@ -92,7 +96,7 @@ pytest tests/ -q
 ## 容器内验证（docker rcs_core_dev）
 
 ```bash
-docker exec -it cuda12_8_torch_2_9_1_core_dev \
+docker exec -it rcs_core_dev \
   bash -c "cd /home/dev/workspace/binglee/rcs_demo && pip install -r requirements.txt && python -m rcs_demo --check"
 # 容器内启动服务后，宿主机浏览器访问 http://localhost:8000（host 网络直通）
 ```
