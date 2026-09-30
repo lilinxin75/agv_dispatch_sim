@@ -1,21 +1,9 @@
-"""启动自检冒烟测试 (T003/T010)。"""
-
-import sys
-
-from rcs_demo.__main__ import main
+"""启动自检（章程 V / quickstart.md / T010）。"""
+import rcs_demo.__main__ as main_mod
 
 
-def test_check_passes(capsys):
-    rc = main(["--check"])
+def test_check_selftest_passes(capsys):
+    # --check 等价自检：布局、A* 抽检、预约互斥、端口绑定（port 0 = 临时端口）
+    assert main_mod._check(port=0) == 0
     out = capsys.readouterr().out
-    assert rc == 0
-    assert "OK" in out
-    assert "layout ok" in out
-    assert "planner ok" in out
-    assert "reservations ok" in out
-    assert "engine ok" in out
-
-
-def test_check_with_seed():
-    assert main(["--check", "--seed", "42"]) == 0
-    assert "rcs_demo" not in sys.argv  # sanity: invoked via main()
+    assert "OK: grid layout / planner / engine self-test passed" in out

@@ -1,67 +1,78 @@
-"""A* 与预约表测试 (T006/T024)。"""
-
-from rcs_demo.config import Config
+"""规划器：A* 可达/绕障、预约互斥、转弯代价（T028）。"""
 from rcs_demo.sim.grid import Grid
-from rcs_demo.sim.planner import Reservations, astar
+from rcs_demo.sim.planner import Planner, ReservationTable
 
 
-def make_grid():
-    return Grid(Config.scaled())
+def make_planner(docked=()):
+    g = Grid()
+    p = Planner(g, lambda c: c in set(docked))
+    p.docked = set(docked)  # 热路径集合（与引擎同构）
+    return g, p
 
 
-def test_path_found_and_adjacent():
-    g = make_grid()
-    path = astar(g, (5, 5), (5, 10))
+def test_reachability_and_shortest():
+    g, p = make_planner()
+    path = p.plan((2, 2), (2, 50), "E", False, set())
+    assert path is not None and len(path) == 48  # 曼哈顿最短
+    assert path[-1] == (2, 50)
+
+
+def test_obstacle_avoidance():
+    g, p = make_planner()
+    for r in range(1, 6):
+        g.add_obstacle((r, 10), tick=0)  # 竖墙阻断直线
+    path = p.plan((3, 5), (3, 15), "E", False, set())
     assert path is not None
-    assert path[0] == (5, 6)  # 不含起点
-    assert path[-1] == (5, 10)
-    assert len(path) == 5
-    # 4 邻接：每步仅差一格
-    prev = (5, 5)
-    for cell in path:
-        assert abs(cell[0] - prev[0]) + abs(cell[1] - prev[1]) == 1
-        prev = cell
+    assert all((r, c) not in g.obstacles for r, c in path)  # 绝不穿障（FR-011）
+    assert len(path) > 10  # 绕行变长
 
 
 def test_unreachable_returns_none():
-    g = make_grid()
-    # 用障碍物把 (5,5) 围死（远离围墙）
-    for r, c in [(4, 4), (4, 5), (4, 6), (5, 4), (5, 6),
-                 (6, 4), (6, 5), (6, 6)]:
-        g.add_obstacle(r, c)
-    assert astar(g, (5, 5), (20, 20)) is None
-    assert astar(g, (20, 20), (5, 5)) is None  # 目标不可达同样返回 None
+    g, p = make_planner()
+    for c in range(0, 200):  # 完全隔断左右
+        g.add_obstacle((100, c), tick=0) if g.kind.get((100, c)) not in (None,) else None
+    path = p.plan((50, 50), (150, 50), "E", False, set())
+    assert path is None
 
 
-def test_obstacle_avoided():
-    g = make_grid()
-    g.add_obstacle(5, 7)
-    path = astar(g, (5, 5), (5, 10))
+def test_carried_tote_cannot_enter_docked_slot():
+    g, p = make_planner(docked=[(50, 50)])
+    # 载货车不得进入静置料箱格（FR-015）
+    assert p.plan((50, 48), (50, 50), "E", True, set()) is None
+    # 无载车可穿行
+    assert p.plan((50, 48), (50, 52), "E", False, set()) is not None
+    # 载货车可绕行到料箱后方
+    assert p.plan((50, 48), (50, 52), "E", True, set()) is not None
+
+
+def test_avoids_occupied_cells():
+    g, p = make_planner()
+    occupied = {(10, 10)}
+    path = p.plan((10, 8), (10, 12), "E", False, occupied)
     assert path is not None
-    assert (5, 7) not in path
+    assert (10, 10) not in path
+
+
+def test_turn_penalty_prefers_straight():
+    g, p = make_planner()
+    # 同起终点：直达直线 vs 强制绕行后同长度路径，直线代价更低
+    straight = p.plan((20, 20), (40, 40), "E", False, set())
+    assert straight is not None
+    # 起终点同距但更少拐弯的路径长度（代价含转弯惩罚）由 A* 直接体现：
+    # 直线路径拐弯次数 ≤ 1（先直行后一次转向）
+    turns = 0
+    d = None
+    for (r1, c1), (r2, c2) in zip([(20, 20)] + straight[:-1], straight):
+        nd = (r2 - r1, c2 - c1)
+        if d is not None and nd != d:
+            turns += 1
+        d = nd
+    assert turns <= 1
 
 
 def test_reservation_mutex():
-    res = Reservations()
-    assert res.claim(5, 5, 10, 1) is True
-    assert res.claim(5, 5, 10, 2) is False  # 同格同 tick 互斥
-    assert res.claim(5, 5, 10, 1) is True   # 同车重复声明 OK
-    assert res.claim(5, 5, 11, 2) is True   # 不同 tick OK（跟随语义）
-    assert res.held_by(5, 5, 10) == 1
-
-
-def test_astar_avoids_others_reservation():
-    g = make_grid()
-    res = Reservations()
-    # 他车预约了直线路径上的格子
-    res.data[(5, 7, 1)] = 99
-    path = astar(g, (5, 5), (5, 10), reservations=res, now=0,
-                 horizon=5, self_id=1)
-    assert path is not None
-    assert (5, 7) not in path
-    # 自己的预约不阻挡自己
-    res2 = Reservations()
-    res2.data[(5, 7, 1)] = 1
-    path2 = astar(g, (5, 5), (5, 10), reservations=res2, now=0,
-                  horizon=5, self_id=1)
-    assert path2 is not None
+    rt = ReservationTable()
+    assert rt.try_reserve((10, 10), vid=1)
+    assert not rt.try_reserve((10, 10), vid=2)  # 同格同刻双预约必失败（quickstart）
+    assert rt.try_reserve((10, 10), vid=1)      # 同车重入成功
+    assert rt.owner((10, 10)) == 1

@@ -1,102 +1,98 @@
-"""冲突事件批次文件分析工具 (FR-023)。
+"""互堵冲突事件分析工具（FR-023，供开发迭代使用，非观看者功能）。
 
-加载 JSONL 批次文件，输出互堵冲突统计报告：
-事件总数与总时长、热点格子 Top-N、带箱/无箱组合占比、
-单次事件时长与规模分布。供开发迭代定位拥堵成因、验证优化效果。
+用法：
+    python -m rcs_demo.analyze_conflicts logs/conflicts_20260929_120000.jsonl
+    python -m rcs_demo.analyze_conflicts logs/ --top 20
 
-用法::
-
-    python -m rcs_demo.analyze_conflicts data/conflict_events_<batch>.jsonl
-    python -m rcs_demo.analyze_conflicts data/*.jsonl        # 多批次合并
-    python rcs_demo/analyze_conflicts.py <file>              # 直接执行
+输出：热点位置 TOP-N、互堵频次（次/千 tick）、单次时长分布统计。
 """
-
 from __future__ import annotations
 
-import glob
+import argparse
 import json
 import sys
 from collections import Counter
+from pathlib import Path
 
 
-def load_events(paths: list[str]) -> list[dict]:
-    events: list[dict] = []
-    for path in paths:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    events.append(json.loads(line))
+def load_events(path: Path) -> list[dict]:
+    events = []
+    with open(path, encoding="utf-8") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if ln:
+                try:
+                    events.append(json.loads(ln))
+                except json.JSONDecodeError as e:
+                    print(f"警告：跳过无法解析的行: {e}", file=sys.stderr)
     return events
 
 
-def carrying_mix(ev: dict) -> str:
-    flags = sorted(v["carrying"] for v in ev["vehicles"])
-    n = len(ev["vehicles"])
-    k = sum(flags)
-    if k == 0:
-        return f"{n}车全无箱"
-    if k == n:
-        return f"{n}车全带箱"
-    return f"{n}车混合({k}带箱)"
-
-
-def report(events: list[dict], top_n: int = 10) -> str:
+def analyze(events: list[dict], top: int = 10) -> dict:
     if not events:
-        return "无冲突事件记录。"
+        return {"count": 0}
+    total_ticks = max(e.get("end_tick", 0) for e in events)
+    durations = [e.get("duration_ticks", 0) for e in events]
+    hotspot_cells = Counter()
+    hotspot_vehicle = Counter()
+    for e in events:
+        for p in e.get("positions", []):
+            hotspot_cells[tuple(p)] += 1
+        for v in e.get("vehicles", []):
+            hotspot_vehicle[v] += 1
+    durations.sort()
+    n = len(durations)
 
-    durations = [ev["duration"] for ev in events]
-    sizes = [len(ev["vehicles"]) for ev in events]
-    total_dur = sum(durations)
+    def pct(p):
+        i = min(n - 1, int(n * p))
+        return durations[i]
 
-    hot_cells: Counter = Counter()
-    for ev in events:
-        hot_cells.update(tuple(c) for c in ev["cells"])
-
-    mixes: Counter = Counter(carrying_mix(ev) for ev in events)
-
-    lines = [
-        f"事件总数: {len(events)}"
-        f"（总阻塞时长 {total_dur} tick，均值 {total_dur / len(events):.1f}）",
-        "",
-        f"热点格子 Top-{top_n}（涉事车辆曾停留的格子）:",
-    ]
-    for (r, c), n in hot_cells.most_common(top_n):
-        bar = "#" * min(n, 40)
-        lines.append(f"  ({r:>3},{c:>3})  {n:>4} 次  {bar}")
-    lines.append("")
-    lines.append("带箱/无箱组合占比:")
-    for mix, n in mixes.most_common():
-        pct = n / len(events) * 100
-        lines.append(f"  {mix:<14} {n:>4} 次  {pct:5.1f}%")
-
-    def dist(name, vals):
-        svals = sorted(vals)
-        med = svals[len(svals) // 2]
-        lines.append(
-            f"{name}: min {min(vals)} / 中位 {med} / "
-            f"max {max(vals)} / 均值 {sum(vals) / len(vals):.1f}"
-        )
-
-    lines.append("")
-    dist("单次事件时长 (tick)", durations)
-    dist("单次事件车辆数", sizes)
-    return "\n".join(lines)
+    return {
+        "count": n,
+        "total_ticks": total_ticks,
+        "freq_per_1000_ticks": round(n / max(total_ticks / 1000, 1e-9), 2),
+        "duration": {
+            "mean": round(sum(durations) / n, 1),
+            "p50": pct(0.5), "p90": pct(0.9), "p99": pct(0.99), "max": durations[-1],
+        },
+        "hotspot_cells": [[list(c), cnt] for c, cnt in hotspot_cells.most_common(top)],
+        "hotspot_vehicles": hotspot_vehicle.most_common(top),
+        "carried_ratio": round(sum(1 for e in events for c in e.get("carried", [])
+                                   if c) / max(sum(len(e.get("carried", []))
+                                                    for e in events), 1), 2),
+    }
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if not args:
-        print(__doc__)
-        return 2
-    paths: list[str] = []
-    for a in args:
-        matched = glob.glob(a)
-        paths.extend(matched if matched else [a])
-    events = load_events(paths)
-    print(report(events))
+def main() -> int:
+    ap = argparse.ArgumentParser(description="互堵冲突事件批次分析")
+    ap.add_argument("path", help="批次 .jsonl 文件或目录")
+    ap.add_argument("--top", type=int, default=10, help="热点 TOP-N（默认 10）")
+    args = ap.parse_args()
+
+    p = Path(args.path)
+    files = sorted(p.glob("*.jsonl")) if p.is_dir() else [p]
+    if not files:
+        print(f"未找到批次文件: {p}", file=sys.stderr)
+        return 1
+
+    for f in files:
+        events = load_events(f)
+        r = analyze(events, args.top)
+        print(f"\n=== {f.name} ===")
+        if r["count"] == 0:
+            print("  无冲突事件")
+            continue
+        print(f"  事件数: {r['count']}   覆盖 tick: {r['total_ticks']}")
+        print(f"  频次: {r['freq_per_1000_ticks']} 次/千 tick")
+        d = r["duration"]
+        print(f"  时长(tick): mean={d['mean']} p50={d['p50']} p90={d['p90']} "
+              f"p99={d['p99']} max={d['max']}")
+        print(f"  涉事车辆载货比例: {r['carried_ratio']}")
+        print(f"  热点位置 TOP{args.top}: {r['hotspot_cells']}")
+        print(f"  高发车辆: {r['hotspot_vehicles']}")
+    print("\n提示：热点格可用于路径代价加权优化（FR-024，配置 RCS_TURN_PENALTY 等）")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

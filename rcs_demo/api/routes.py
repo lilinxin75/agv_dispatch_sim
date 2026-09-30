@@ -1,70 +1,81 @@
-"""FastAPI 应用：REST 控制接口 + WebSocket 状态流 (contracts/)。"""
+"""REST 控制接口 + WebSocket 状态流（契约 rest-api.md / websocket.md）。
 
+由本模块创建 FastAPI 应用并托管仿真 tick 循环（单进程 asyncio，R5）
+与静态前端（章程 II：Python 服务直接托管）。
+"""
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import pathlib
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from rcs_demo.sim.engine import Engine
-from rcs_demo.sim.grid import ObstacleError
+from .. import config as cfg
+from ..sim.engine import Engine
+from ..sim.entities import Cell
 
-STATIC_DIR = pathlib.Path(__file__).resolve().parent.parent / "static"
-
-
-class Connection:
-    def __init__(self, ws: WebSocket):
-        self.ws = ws
-        self.watch_vehicle: int | None = None
-        self.lock = asyncio.Lock()
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
-def create_app(engine: Engine) -> FastAPI:
-    app = FastAPI(title="RCS Multi-Vehicle Dispatch Demo")
-    app.state.engine = engine
-    connections: set[Connection] = set()
-    loop_task: asyncio.Task | None = None
+async def _run_engine(engine: Engine, fast: bool = False):
+    interval = 1.0 / cfg.TICK_RATE * (0.1 if fast else 1.0)
+    while True:
+        t0 = time.perf_counter()
+        if not engine.paused:
+            engine.tick()
+        spent = time.perf_counter() - t0
+        await asyncio.sleep(max(0.0, interval - spent))
 
-    # ------------------------------------------------------------ REST
+
+def create_app(engine: Engine, fast: bool = False) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        task = asyncio.create_task(_run_engine(engine, fast))
+        yield
+        task.cancel()
+
+    app = FastAPI(title="RCS Multi-Vehicle Dispatch Demo", version="1.0.0",
+                  lifespan=lifespan)
+
+    # ---- REST（契约 rest-api.md）----
+
     @app.get("/api/state")
     async def get_state():
         return engine.snapshot()
 
+    @app.get("/api/config")
+    async def get_config():
+        return cfg.all_params()
+
+    @app.get("/api/vehicle/{vid}")
+    async def get_vehicle(vid: int):
+        d = engine.vehicle_detail(vid)
+        if d is None:
+            return JSONResponse({"error": "unknown vehicle id"}, status_code=404)
+        return d
+
     @app.post("/api/obstacle")
     async def add_obstacle(body: dict):
-        cell = body.get("cell")
-        if (
-            not isinstance(cell, list)
-            or len(cell) != 2
-            or not all(isinstance(x, int) for x in cell)
-        ):
-            return JSONResponse({"error": "cell must be [row, col]"}, 400)
-        try:
-            added = engine.add_obstacle(cell[0], cell[1])
-        except ObstacleError as exc:
-            return JSONResponse({"error": str(exc)}, 409)
-        await broadcast_obstacle(added=[cell] if added else [])
-        return {"ok": True, "cell": cell}
+        cell = _parse_cell(body)
+        if cell is None:
+            return JSONResponse({"error": "invalid cell"}, status_code=400)
+        ok, reason = engine.add_obstacle(cell)
+        if not ok:
+            return JSONResponse({"error": reason}, status_code=409)
+        return {"ok": True, "cell": list(cell)}
 
     @app.delete("/api/obstacle")
     async def remove_obstacle(body: dict):
-        cell = body.get("cell")
-        if (
-            not isinstance(cell, list)
-            or len(cell) != 2
-            or not all(isinstance(x, int) for x in cell)
-        ):
-            return JSONResponse({"error": "cell must be [row, col]"}, 400)
-        try:
-            removed = engine.remove_obstacle(cell[0], cell[1])
-        except ObstacleError as exc:
-            return JSONResponse({"error": str(exc)}, 404)
-        await broadcast_obstacle(removed=[cell] if removed else [])
+        cell = _parse_cell(body)
+        if cell is None:
+            return JSONResponse({"error": "invalid cell"}, status_code=400)
+        if not engine.remove_obstacle(cell):
+            return JSONResponse({"error": "no obstacle at cell"}, status_code=404)
         return {"ok": True}
 
     @app.post("/api/control/pause")
@@ -77,99 +88,71 @@ def create_app(engine: Engine) -> FastAPI:
         engine.paused = False
         return {"ok": True, "paused": False}
 
-    @app.get("/api/vehicle/{vid}")
-    async def vehicle(vid: int):
-        detail = engine.vehicle_detail(vid)
-        if detail is None:
-            return JSONResponse({"error": f"unknown vehicle {vid}"}, 404)
-        return detail["vehicle"]
-
     @app.post("/api/reset")
     async def reset():
-        new_engine = Engine(engine.cfg, seed=None)
-        engine.__dict__.update(new_engine.__dict__)
-        for conn in list(connections):
-            with contextlib.suppress(Exception):
-                await send_json(conn, {"type": "snapshot",
-                                       **engine.snapshot()})
+        engine.reset()
         return {"ok": True}
 
-    # ------------------------------------------------------------ WS 广播
-    async def send_json(conn: Connection, payload: dict) -> None:
-        async with conn.lock:
-            await conn.ws.send_text(json.dumps(payload, separators=(",", ":")))
-
-    async def broadcast(payload: dict) -> None:
-        for conn in list(connections):
-            with contextlib.suppress(Exception):
-                await send_json(conn, payload)
-
-    async def broadcast_obstacle(added=(), removed=()):
-        if added or removed:
-            await broadcast({
-                "type": "obstacle_changed", "tick": engine.tick,
-                "added": [list(a) for a in added],
-                "removed": [list(r) for r in removed],
-            })
-
-    async def sim_loop(tick_interval: float) -> None:
-        while True:
-            if not engine.paused:
-                engine.step()
-                delta = engine.pop_delta()
-                events = engine.pop_events()
-                await broadcast(delta)
-                for evt in events:
-                    await broadcast(evt)
-                # 订阅中的单车详情推送
-                for conn in list(connections):
-                    if conn.watch_vehicle is not None:
-                        detail = engine.vehicle_detail(conn.watch_vehicle)
-                        if detail is not None:
-                            with contextlib.suppress(Exception):
-                                await send_json(conn, detail)
-            await asyncio.sleep(tick_interval)
+    # ---- WebSocket（契约 websocket.md）----
 
     @app.websocket("/ws")
-    async def websocket_endpoint(ws: WebSocket):
-        nonlocal loop_task
+    async def ws_endpoint(ws: WebSocket):
         await ws.accept()
-        conn = Connection(ws)
-        connections.add(conn)
+        watched: int | None = None
+        last_tick = engine.tick_n
         try:
-            await send_json(conn, {"type": "snapshot", **engine.snapshot()})
+            await ws.send_text(json.dumps({"type": "snapshot", **engine.snapshot()},
+                                          ensure_ascii=False))
             while True:
-                raw = await ws.receive_text()
+                # 非阻塞收客户端消息（watch / ping）
                 try:
-                    msg = json.loads(raw)
-                except ValueError:
-                    continue
-                mtype = msg.get("type")
-                if mtype == "watch":
-                    conn.watch_vehicle = msg.get("vehicle_id")
-                    if conn.watch_vehicle is not None:
-                        detail = engine.vehicle_detail(conn.watch_vehicle)
+                    msg = await asyncio.wait_for(ws.receive_text(), timeout=0.02)
+                    data = json.loads(msg)
+                    if data.get("type") == "watch":
+                        watched = data.get("vehicle_id")
+                        if watched is not None:
+                            detail = engine.vehicle_detail(watched)
+                            if detail is not None:
+                                await ws.send_text(json.dumps(
+                                    {"type": "vehicle_detail", "vehicle": detail},
+                                    ensure_ascii=False))
+                    elif data.get("type") == "ping":
+                        await ws.send_text(json.dumps(
+                            {"type": "pong", "tick": engine.tick_n}))
+                except asyncio.TimeoutError:
+                    pass
+                # 增量推送（≤100ms 一条；paused 时仅事件型消息）
+                if engine.tick_n != last_tick:
+                    last_tick = engine.tick_n
+                    await ws.send_text(json.dumps(
+                        {"type": "delta", **engine.last_delta()},
+                        ensure_ascii=False))
+                    if watched is not None:
+                        detail = engine.vehicle_detail(watched)
                         if detail is not None:
-                            await send_json(conn, detail)
-                elif mtype == "ping":
-                    await send_json(conn, {"type": "pong", "tick": engine.tick})
-        except WebSocketDisconnect:
+                            await ws.send_text(json.dumps(
+                                {"type": "vehicle_detail", "vehicle": detail},
+                                ensure_ascii=False))
+                for ev in engine.drain_ws_events():
+                    await ws.send_text(json.dumps(ev, ensure_ascii=False))
+        except (WebSocketDisconnect, asyncio.CancelledError):
             pass
-        finally:
-            connections.discard(conn)
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
-    @app.on_event("startup")
-    async def startup():
-        nonlocal loop_task
-        interval = 1.0 / (engine.cfg.tick_rate *
-                          (engine.cfg.fast_multiplier if engine.cfg.fast else 1))
-        loop_task = asyncio.create_task(sim_loop(interval))
-
-    @app.on_event("shutdown")
-    async def shutdown():
-        if loop_task is not None:
-            loop_task.cancel()
+    # ---- 静态前端（章程 II）----
 
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True),
               name="static")
     return app
+
+
+def _parse_cell(body: dict) -> Cell | None:
+    cell = body.get("cell") if isinstance(body, dict) else None
+    if (isinstance(cell, list) and len(cell) == 2
+            and all(isinstance(x, int) and 0 <= x < cfg.GRID for x in cell)):
+        return (cell[0], cell[1])
+    return None

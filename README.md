@@ -1,97 +1,128 @@
-# RCS 多车料箱搬运调度演示
+# RCS 多车料箱搬运调度演示 (Multi-Vehicle Grid Dispatch Demo)
 
-仓储场景的多车调度 2D 仿真演示：200×200 网格地图、100 台小车、入库/出库料箱搬运、
-时空预约零碰撞调度、前端动态增删障碍物。
+仓储料箱搬运调度演示：200×200 网格地图、100 台同质小车在离散时间步进仿真中
+执行入库/出库料箱搬运任务（1:1 成对生成、循环复用），A* 路径规划（转弯软代价，
+偏向直线）+ 时空预约保证零碰撞，死锁自动恢复，电量模型与集中充电区，
+前端 Canvas 双层可视化，支持动态增删障碍物与视口缩放平移。
 
-## 启动（≤3 条命令）
+## 启动（3 条命令内）
 
 ```bash
 pip install -r requirements.txt
-python -m rcs_demo            # 默认 0.0.0.0:8000
+python -m rcs_demo            # 默认 0.0.0.0:8000，--port 改端口
 # 浏览器打开 http://localhost:8000
 ```
 
-可选参数：
+可选参数：`--port N`（端口）、`--seed N`（固定随机种子复现场景）、`--fast`（仿真 10 倍加速）。
 
-| 参数 | 说明 |
-|------|------|
-| `--port N` | 服务端口（默认 8000，可用 `RCS_PORT` 环境变量） |
-| `--seed N` | 固定随机种子，复现同一场景 |
-| `--fast` | 仿真时钟 ×5 加速 |
-| `--check` | 运行自检（布局/规划器/预约/引擎）后退出 |
+## 停止
 
-## 停止方式
+终端 `Ctrl+C`。
 
-前台运行直接 `Ctrl+C`。
-
-## 场景说明
-
-- **地图**：200×200 格；中部货架区含 2400 个存储点位（半仓初始约 1200 箱）；
-  西缘入库口、东缘出库口各 50 格。
-- **任务**：入库（入库口→点位）与出库（点位→出库口）按 1:1 成对生成；
-  出库料箱送达后循环回入库口，同一批料箱永久复用，演示可无限运行。
-- **调度**：least-loaded 均匀分配（任意两车累计分配差 ≤1~2）；A* 4 邻接寻路；
-  时空预约表保证任一时刻任一格至多一台车（零碰撞）；路径重合时后车原地等待。
-- **死锁恢复**：级联让路（等待中的挡路车向邻近空格侧移）→ 重规划 → 任务改派三层兜底。
-- **穿行**：小车可从静置料箱底部穿行；携带料箱时该格视为占用。
-- **冲突记录与优化**：互堵冲突（≥2 台车相互等待成团）自动记录为事件，按批次落盘
-  `data/conflict_events_<启动时间戳>.jsonl`；拥堵优化默认开启——热点格子热力加权寻路、
-  任务点位避开高热区、拥堵背压限流、更早的级联让路、拥堵感知就近指派。
-
-## 前端操作
-
-| 操作 | 效果 |
-|------|------|
-| 点击小车 | 查看编号/状态/任务/剩余路径 |
-| 点击空格 | 添加障碍物（1s 内生效，车流绕行） |
-| 点击障碍物 | 删除障碍物（车流恢复） |
-| 暂停 / 恢复 / 重置 | 仿真控制（暂停时仍可编辑障碍物） |
-| 显示编号 | 切换小车编号显示 |
-
-右侧面板实时显示任务完成数、各车负载分布、等待/受阻车辆数、事件日志。
-
-## 验证
+## 启动自检
 
 ```bash
-python -m rcs_demo --check     # 启动自检
-pytest tests/ -q               # 缩尺快速回归（38 项）
+python -m rcs_demo --check
 ```
 
-测试覆盖：布局约束、A* 与预约互斥、零碰撞、任务 1:1 成对、分配均匀性（±20%）、
-料箱循环复用、障碍物校验与绕行、对向会车恢复、围堵解除恢复。
+校验固定布局生成（货架区 2400 点位/站点/充电区）、A* 可达性抽检、预约表互斥、
+API 端口可绑定，输出 `OK: grid layout / planner / engine self-test passed`。
 
-## docker 容器内验证（rcs_core_dev）
+## 功能清单
+
+- **可视化运行画面**：200×200 网格、100 台编号小车实时移动（10 tick/s 逻辑 +
+  前端插值渲染），料箱半透明方块叠于点位、小车带编号圆点，车在箱下穿行 / 料箱跟随携带车显示
+- **任务调度**：入库/出库任务 1:1 成对生成（1 任务/秒），least-loaded 均匀分配
+  （任意两车差 ≤ 平均值 ±20%），料箱出库后循环回入库口无限演示
+- **零碰撞**：时空预约 + 逐 tick 移动仲裁，路径重合自动等待排队，任意时刻任一格至多一车
+- **动态障碍物**：页面点击空地添加 / 点击障碍物删除，1 秒内影响规划并触发绕行重规划；
+  被车/料箱占据或站点/充电区格拒绝（toast 提示）
+- **死锁避免与恢复**：15s 未移动检测 → 重规划 → 让路 → 改派三级恢复；事件面板实时显示
+- **电量与充电**：满电 1000 点，空载 1 点/格、载货 1.5 点/格；低于 20% 完成当前任务后
+  自动前往南侧集中充电区（10 充电位、西进东出单向通道、桩满低电量优先排队），
+  30 秒充满返回；无电量耗尽停摆
+- **视口缩放平移**：滚轮以光标为锚缩放 0.25×–4×，拖拽平移（与点击智能区分，无需切换模式），
+  一键复位整图
+- **指标面板**：完成任务数、等待/受阻车辆数、碰撞计数（恒 0）、充电中/排队数、
+  平均电量、各车完成数分布
+- **冲突事件记录分析（面向开发迭代）**：≥2 台车成团互堵判定为一次事件，
+  JSONL 落盘 `logs/conflicts_<启动时间戳>.jsonl`；分析工具输出热点位置、
+  频次（次/千 tick）、时长分布：
+  ```bash
+  python -m rcs_demo.analyze_conflicts logs/conflicts_XXXXXX.jsonl
+  ```
+
+## 可调参数（RCS_* 环境变量覆盖，全量见 `GET /api/config`）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `RCS_TASKS_PER_SECOND` | 1 | 任务生成节奏（核算基准） |
+| `RCS_BATTERY_FULL` | 1000 | 满电点数（可续航格数） |
+| `RCS_LOAD_FACTOR` | 1.5 | 载货每格耗电倍率（空载 1 点/格） |
+| `RCS_BATTERY_LOW_RATIO` | 0.2 | 低电阈值（触发充电标记） |
+| `RCS_BATTERY_CRITICAL_RATIO` | 0.05 | 临界阈值（兜底直奔充电区） |
+| `RCS_CHARGE_SECONDS` | 30 | 从 20% 充到满电秒数 |
+| `RCS_CHARGE_PILES` | 10 | 充电位数量（FR-029 公式核算默认值） |
+| `RCS_TURN_PENALTY` | 3 | 每次转向的路径代价惩罚（软约束） |
+| `RCS_ZOOM_MIN` / `RCS_ZOOM_MAX` | 0.25 / 4.0 | 前端视口缩放范围 |
+| `RCS_TICK_RATE` | 10 | 仿真 tick 频率（/秒） |
+| `RCS_STALL_TICKS` | 150 | 卡死检测阈值（tick，~15s） |
+
+充电位数量按 FR-029 公式联动：忙碌桩数 ≈ 任务节奏 × 单任务平均耗电 ÷ 单桩充电速率，
+上取整 + 约 30% 余量；基准参数核算结果为 10（`GET /api/config` 的
+`recommended_charge_piles` 显示当前核算值）。
+
+## REST / WebSocket 接口
+
+见 [specs/001-multi-vehicle-dispatch/contracts/](specs/001-multi-vehicle-dispatch/contracts/)：
+`GET /api/state`、`GET /api/vehicle/{id}`、`GET /api/config`、
+`POST/DELETE /api/obstacle`、`POST /api/control/pause|resume`、`POST /api/reset`、
+`WS /ws`（snapshot + delta + 事件流）。
+
+## 自动化测试
+
+```bash
+pytest tests/ -q
+```
+
+缩尺快速回归（40×40 / 10 车 / 与全量共享引擎代码）：布局约束、A* 可达/绕障/转弯代价、
+预约互斥、零碰撞、分配均匀性、空闲不漫游、电量扣减与充电流程、充电位互斥、
+死锁恢复、冲突事件 JSONL。
+
+## 容器内验证（docker rcs_core_dev）
 
 ```bash
 docker exec -it cuda12_8_torch_2_9_1_core_dev \
   bash -c "cd /home/dev/workspace/binglee/rcs_demo && pip install -r requirements.txt && python -m rcs_demo --check"
-# 容器内启动服务后宿主机浏览器直接访问 http://localhost:8000（host 网络直通）
+# 容器内启动服务后，宿主机浏览器访问 http://localhost:8000（host 网络直通）
 ```
 
-## 可调参数（环境变量 `RCS_*`）
+## 已知限制与调优选择点（长期运行稳态）
 
-`RCS_PORT` `RCS_VEHICLE_COUNT` `RCS_TICK_RATE` `RCS_TASK_INTERVAL`
-`RCS_STALL_THRESHOLD` `RCS_FILL_RATIO` `RCS_INBOUND_INITIAL_TOTES`
-`RCS_MAX_QUEUED_TASKS` `RCS_RECORD_CONFLICTS` `RCS_CONFLICT_OPTIMIZATION`
-`RCS_DATA_DIR`
+- **基准负载长时稳态**：前 10–20 分钟运行流畅（任务持续推进、零碰撞、自恢复可见）；
+  持续满负载下拥塞逐步累积，部分车辆进入等待/受阻状态并占用在途额度，
+  任务生成快于消化的时段吞吐会回落。可选调优（均可用环境变量/开关验证）：
+  - `RCS_MAX_ACTIVE_TASKS`（默认 80）：在途任务上限，调低可减轻拥塞
+  - `RCS_ONE_WAY_AISLES=1`：货架横向通道单向化（实验性；实测长单向通道易锁死，默认关）
+  - `RCS_STALL_TICKS`：卡死检测阈值（默认 150 tick≈15s）
+  - 深层方案（WHCA\* 窗口式时空规划 / 全图车道纪律）为后续迭代选择点
+- **缩尺回归口径**：FR-004 ±20% 均匀性在规格全尺寸场景（100 车/10 桩）验收；
+  40×40 缩尺因充电占空比与窄道拥塞被放大，测试仅断言烟测上界（tests/test_simulation.py 注释）
 
-| 开关 | 默认 | 说明 |
-|------|------|------|
-| `RCS_RECORD_CONFLICTS` | `1` | 互堵冲突事件记录（0 关闭，停止写 JSONL） |
-| `RCS_CONFLICT_OPTIMIZATION` | `1` | 拥堵优化（0 关闭可作 A/B 基线） |
-| `RCS_DATA_DIR` | `data` | 冲突事件批次文件目录 |
+## 目录结构
 
-## 冲突事件分析（开发迭代用）
-
-```bash
-python -m rcs_demo.analyze_conflicts data/conflict_events_<批次>.jsonl
-python -m rcs_demo.analyze_conflicts 'data/*.jsonl'   # 多批次合并
+```text
+rcs_demo/
+├── __main__.py            # 入口（--check/--port/--seed/--fast）
+├── config.py              # 全量可调参数（RCS_* env 覆盖）
+├── analyze_conflicts.py   # 冲突事件批次分析 CLI
+├── sim/
+│   ├── grid.py            # 网格与固定布局（货架/站点/充电区/环场道）
+│   ├── entities.py        # Vehicle/Tote/Task/Obstacle/ChargingArea
+│   ├── planner.py         # 方向感知 A* + 预约表
+│   ├── dispatcher.py      # 1:1 任务生成 + least-loaded 分配
+│   ├── charging.py        # 充电位/排队管理
+│   └── engine.py          # tick 循环/移动仲裁/死锁恢复/冲突事件/指标
+├── api/routes.py          # REST + WebSocket + 静态托管
+└── static/                # 前端（原生 HTML/CSS/JS，三层 Canvas）
 ```
-
-输出事件总数与总时长、热点格子 Top-N、带箱/无箱组合占比、单次事件时长与规模分布。
-JSONL 每行一个事件：`batch / start_tick / end_tick / duration / vehicles[{id,carrying}] / cells`。
-
-## 技术栈
-
-Python 3.10+ / FastAPI + uvicorn（WebSocket 状态流）/ 原生 Canvas 2D 三层渲染，
-无数据库、无前端构建链。设计文档见 `specs/001-multi-vehicle-dispatch/`。

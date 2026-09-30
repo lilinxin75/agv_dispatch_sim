@@ -1,781 +1,938 @@
-"""仿真引擎：tick 推进、零碰撞移动、任务执行、料箱循环、指标与增量。"""
+"""仿真引擎：tick 循环、移动执行、死锁检测恢复、冲突事件、指标快照。
 
+单进程 asyncio 驱动（research.md R5），10 tick/s；每 tick：
+任务生成 → 派单 → 规划 → 预约仲裁与移动 → 到达处理 → 充电推进 →
+排队调度 → 死锁检测/恢复 → 冲突事件 → 料箱循环 → 指标。
+"""
 from __future__ import annotations
 
+import json
+import os
 import random
+import time
 from collections import deque
+from typing import Optional
 
-from rcs_demo.config import Config
-from rcs_demo.sim import entities as E
-from rcs_demo.sim.conflicts import ConflictRecorder
-from rcs_demo.sim.dispatcher import Dispatcher
-from rcs_demo.sim.grid import CellKind, CollisionError, Grid, ObstacleError
-from rcs_demo.sim.planner import Reservations, astar, planner_self_test
+from .. import config as cfg
+from .charging import ChargingManager
+from .dispatcher import Dispatcher
+from .entities import (Cell, CellKind, ConflictEvent, Task, TaskState, Tote,
+                       ToteState, Vehicle, VehicleState)
+from .grid import Grid
+from .planner import Planner, ReservationTable
 
-FACING = {
-    (-1, 0): "N", (1, 0): "S", (0, -1): "W", (0, 1): "E",
-}
+INBOUND_POOL_SIZE = 30  # 初始置于入库口的循环料箱数（1:1 成对生成的启动池）
 
 
 class Engine:
-    def __init__(self, cfg: Config, seed: int | None = None):
-        self.cfg = cfg
-        self.rnd = random.Random(seed)
-        self.grid = Grid(cfg)
-        self.reservations = Reservations()
-        self.dispatcher = Dispatcher()
+    def __init__(self, seed: int | None = None, conflict_log_dir: str | None = None):
+        self.rng = random.Random(seed)
+        self.grid = Grid()
+        self.planner = Planner(self.grid, self._tote_at)
+        self.reservations = ReservationTable()
+        self.dispatcher = Dispatcher(self.grid, self.rng)
+        self.charging = ChargingManager(self.grid.charging)
 
-        self.tick = 0
+        self.tick_n = 0
         self.paused = False
-        self.vehicles: dict[int, E.Vehicle] = {}
-        self.totes: dict[int, E.Tote] = {}
-        self.tasks: dict[int, E.Task] = {}
-        self.task_queue: list[int] = []          # FIFO（含 blocked，按状态过滤）
-        self.blocked: set[int] = set()
         self.collision_count = 0
-        self._next_task_id = 1
-        self._next_tote_id = 1
 
-        self.events: deque = deque(maxlen=cfg.max_events)
+        self.vehicles: dict[int, Vehicle] = {}
+        self.totes: dict[int, Tote] = {}
+        self.occupant: dict[Cell, int] = {}          # cell -> vehicle_id
+        self.docked_cells: set[Cell] = set()         # 静置料箱所在格（O(1) 查询）
+        self.planner.docked = self.docked_cells      # O(1) 热路径引用
+        self.dispatcher.docked_cells = self.docked_cells  # O(1) 空点位查询
+        self.inbound_pool: deque[int] = deque()      # 在入库口等待入库的料箱 id
+        self.cycling: list[tuple[int, int]] = []     # (tote_id, ready_tick) 出库口→入库口
+
+        self.metrics_tasks_done = 0
+        self.conflict_events: list[ConflictEvent] = []
+        self._active_conflicts: list[ConflictEvent] = []
+        self._wait_graph: dict[int, int] = {}
+        self._prev_batt: dict[int, int] = {}
+        self._recover_cooldown: dict[int, int] = {}
+        self._plan_fail_tick: dict[int, int] = {}
+        self._park_try_tick: dict[int, int] = {}
+        self._parked_ok: set[Cell] = set()  # 已靠边停好的车所在格
+        self._delta: dict = {"tick": 0, "vehicles": [], "totes": [], "metrics": {}}
         self._pending_events: list[dict] = []
-        self._moves: dict[int, tuple] = {}       # vid -> (from, to)
-        self._touched_vehicles: set[int] = set()
-        self._touched_totes: set[int] = set()
-        self.metrics: dict = {}
-
-        # --- Phase 9：冲突记录 + 拥堵热力 + 带箱避让集合 ---
-        self.recorder = ConflictRecorder(
-            data_dir=cfg.data_dir, enabled=cfg.record_conflicts,
-        )
-        self.wait_heat: dict[tuple, float] = {}  # 等待密度热力（拥堵加权）
-        self.tote_cells: set[tuple] = set()      # 静置料箱格（带箱车禁入）
-
-        self.stats = {
-            "tasks_generated": {"inbound": 0, "outbound": 0},
-            "tasks_done": {"inbound": 0, "outbound": 0},
-            "totes_recycled": 0,
-        }
 
         self._init_world()
+        self._open_conflict_log(conflict_log_dir)
 
-    # ================================================================ 初始化
-    def _init_world(self) -> None:
-        cfg = self.cfg
-        interior = [
-            (r, c)
-            for r in range(2, self.grid.size - 2)
-            for c in range(2, self.grid.size - 2)
-            if self.grid.is_passable(r, c)
-        ]
-        self.rnd.shuffle(interior)
-        for i in range(cfg.vehicle_count):
-            r, c = interior[i]
-            v = E.Vehicle(id=i + 1, cell=(r, c))
+    # ---- 世界初始化（FR-002/FR-017）----
+
+    def _init_world(self):
+        # 半仓料箱（FR-017）+ 入库口启动池（保证 1:1 成对生成可启动）
+        slots = self.grid.slots[:]
+        self.rng.shuffle(slots)
+        n_half = len(slots) // 2
+        n_pool = min(INBOUND_POOL_SIZE, n_half)
+        tid = 1
+        for slot in slots[:n_half - n_pool]:
+            self.totes[tid] = Tote(id=tid, location=slot, state=ToteState.DOCKED)
+            self.docked_cells.add(slot)
+            tid += 1
+        for _ in range(n_pool):
+            self.totes[tid] = Tote(id=tid, location="inbound", state=ToteState.DOCKED)
+            self.inbound_pool.append(tid)
+            tid += 1
+
+        # 100 台车随机分布（不在围墙/充电区/站点格）
+        valid = [c for c, k in self.grid.kind.items()
+                 if k == CellKind.FLOOR and c not in self.grid.obstacles
+                 and not self.grid.in_charging_area(c)]
+        self.rng.shuffle(valid)
+        for i in range(cfg.VEHICLES):
+            cell = valid[i % len(valid)]
+            v = Vehicle(id=i + 1, cell=cell, render_from=cell,
+                        battery=cfg.BATTERY_FULL)
+            v.facing = self.rng.choice(["N", "E", "S", "W"])
             self.vehicles[v.id] = v
-            self.grid.set_occupant(r, c, v.id)
+            self.occupant[cell] = v.id
 
-        slots = list(self.grid.slots)
-        self.rnd.shuffle(slots)
-        n_fill = int(len(slots) * cfg.fill_ratio)
-        for r, c in slots[:n_fill]:
-            self._new_tote((r, c))
-        inbound = [c for c in self.grid.inbound_cells
-                   if self.grid.is_passable(*c)]
-        for r, c in inbound[: cfg.inbound_initial_totes]:
-            self._new_tote((r, c))
-        self.tote_cells = {
-            t.location for t in self.totes.values() if t.state == E.T_DOCKED
-        }
+    def _open_conflict_log(self, log_dir: str | None):
+        """FR-023：每次启动一个批次文件（文件名含启动时间戳）。"""
+        d = log_dir or cfg.CONFLICT_LOG_DIR
+        os.makedirs(d, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self.conflict_log_path = os.path.join(d, f"conflicts_{ts}.jsonl")
+        self._conflict_fh = open(self.conflict_log_path, "a", encoding="utf-8")
 
-    def _new_tote(self, location: tuple[int, int]) -> E.Tote:
-        tote = E.Tote(id=self._next_tote_id, location=location)
-        self._next_tote_id += 1
-        self.totes[tote.id] = tote
-        return tote
+    def close(self):
+        if getattr(self, "_conflict_fh", None):
+            self._conflict_fh.close()
 
-    # ================================================================ 主循环
-    def step(self) -> None:
-        self.tick += 1
-        t = self.tick
-        self.reservations.gc(t)
-        self.dispatcher.generate(self)
-        self.dispatcher.assign(self)
-        self._wander()
-        self.dispatcher.recovery(self)
-        self._movement(t)
-        self._arrivals()
-        self._cycling()
-        self._update_heat()
-        self._update_metrics()
-        self.recorder.observe(self)
+    # ---- 查询 ----
 
-    def _carrying(self, v: E.Vehicle) -> bool:
-        """该车是否正携带料箱（决定 FR-015 避让静置料箱格）。"""
-        return (
-            v.task_id is not None
-            and self.tasks[v.task_id].state == E.K_IN_PROGRESS
-        )
+    def _tote_at(self, cell: Cell) -> bool:
+        return cell in self.docked_cells
 
-    def _in_shelf(self, r: int, c: int) -> bool:
-        cfg = self.cfg
-        return (
-            cfg.shelf_row_range[0] <= r <= cfg.shelf_row_range[1]
-            and cfg.shelf_col_range[0] <= c <= cfg.shelf_col_range[1]
-        )
+    def occupied_by_others(self, vid: int) -> set[Cell]:
+        return {c for c, v in self.occupant.items() if v != vid}
 
-    def _plan_extras(self, v: E.Vehicle):
-        """astar 的 avoid / extra_cost 参数：带箱避让 + 拥堵加权 (FR-024)。"""
-        avoid = self.tote_cells if self._carrying(v) else None
-        if not self.cfg.conflict_optimization:
-            return avoid, None
-        target_outside = (
-            v.target is not None and not self._in_shelf(*v.target)
-        )
-        salt = self.rnd.randrange(1 << 30)  # 本次规划的路径多样化抖动
+    # ---- 主循环 ----
 
-        def cost(cell):
-            c = self.wait_heat.get(cell, 0.0)
-            # 过境车流绕行货架窄道：目标在货架区外时，货架内通道加重
-            if target_outside and self._in_shelf(*cell):
-                c += 3.0
-            # 等价路径随机分流：不同车选不同等价路线，降低对头相遇
-            c += (hash((cell[0], cell[1], salt)) & 0x7F) / 1024.0
-            return c
+    def tick(self):
+        self.tick_n += 1
+        self._wait_graph.clear()
+        changed_v: set[int] = set()
+        changed_t: set[int] = set()
+        events: list[dict] = []
 
-        return avoid, cost
+        self.dispatcher.maybe_generate(self.tick_n, self.totes, self.inbound_pool)
+        self._assign_tasks(changed_v, events)
+        self._plan_paths(changed_v)
+        self._move_vehicles(changed_v, changed_t, events)
+        self._handle_arrivals(changed_v, changed_t, events)
+        self._charge_progress(changed_v, changed_t, events)
+        self._charge_queue_scheduling(changed_v, events)
+        self._cycling_advance(changed_t)
+        self._need_charge_flags(changed_v, events)
+        self._deadlock_detection(changed_v, events)
+        self._conflict_detection()
+        self._finalize_conflicts()
+        self._decay_hotspots()
+        self._build_delta(changed_v, changed_t, events)
 
-    def _astar(self, v: E.Vehicle, goal: tuple) -> list | None:
-        """带拥堵/避箱代价的规划；扩展超限时退化为普通代价重试。
+    # ---- 增量组装（契约 websocket.md）----
 
-        附加代价闭包会放大 A* 单次开销，故首次尝试限制扩展数，
-        失败（含不可达判定受限）后去掉拥堵代价重试一次兜底。
-        """
-        avoid, extra = self._plan_extras(v)
-        kw = dict(
-            reservations=self.reservations, now=self.tick,
-            horizon=self.cfg.reserve_horizon, self_id=v.id,
-            avoid=avoid, extra_cost=extra,
-        )
-        if extra is not None:
-            # 附加代价抬高了代价面，用加权启发保持搜索贪心性
-            # （有界次优，换数量级的扩展速度）
-            path = astar(self.grid, v.cell, goal, max_expand=15_000,
-                         h_weight=1.3, **kw)
-        else:
-            path = astar(self.grid, v.cell, goal, max_expand=40_000, **kw)
-        if path is None and extra is not None:
-            kw["extra_cost"] = None
-            path = astar(self.grid, v.cell, goal, max_expand=40_000, **kw)
-        return path
+    def _build_delta(self, changed_v: set[int], changed_t: set[int],
+                     events: list[dict]):
+        vs = []
+        for vid in changed_v:
+            v = self.vehicles.get(vid)
+            if v is None:
+                continue
+            d = {"id": v.id, "from": list(v.render_from), "to": list(v.cell),
+                 "state": v.state.value}
+            b = int(v.battery)
+            if b != self._prev_batt.get(v.id):
+                d["battery"] = b
+                self._prev_batt[v.id] = b
+            vs.append(d)
+        ts = [{"id": tid, **self._tote_loc(self.totes[tid]),
+               "state": self.totes[tid].state.value}
+              for tid in changed_t if tid in self.totes]
+        self._delta = {"tick": self.tick_n, "vehicles": vs, "totes": ts,
+                       "metrics": self._metrics()}
+        for e in events:
+            self._pending_events.append({"type": "event", "tick": self.tick_n,
+                                         **e})
+        for kind, vid in self.charging.drain_events():
+            self._pending_events.append({"type": "event", "tick": self.tick_n,
+                                         "kind": kind, "vehicle_id": vid})
 
-    def _update_heat(self) -> None:
-        """记录等待密度热力（衰减），供拥堵感知路径/选点加权 (FR-024)。"""
-        if not self.cfg.conflict_optimization:
+    def last_delta(self) -> dict:
+        return self._delta
+
+    def drain_ws_events(self) -> list[dict]:
+        ev = self._pending_events
+        self._pending_events = []
+        return ev
+
+    # ---- 派单（FR-004 / R4）----
+
+    def _assign_tasks(self, changed_v: set[int], events: list[dict]):
+        # WIP 限流（规格假设：基准负载约 80 台在途、20 台空闲待命）：
+        # 在途任务达上限时停止派发，防止全队投入引发拥塞死亡螺旋
+        active = sum(1 for t in self.dispatcher.tasks.values()
+                     if t.state in (TaskState.ASSIGNED, TaskState.IN_PROGRESS))
+        if active >= cfg.MAX_ACTIVE_TASKS:
             return
-        for v in self.vehicles.values():
-            if v.state in (E.V_WAITING, E.V_STALLED):
-                self.wait_heat[v.cell] = (
-                    self.wait_heat.get(v.cell, 0.0) + 1.0
-                )
-        if self.tick % 20 == 0 and self.wait_heat:
-            self.wait_heat = {
-                k: val * 0.9
-                for k, val in self.wait_heat.items() if val > 0.05
-            }
-
-    # ------------------------------------------------------------- 漫游目标
-    def _wander(self) -> None:
-        for v in self.vehicles.values():
-            if v.task_id is not None:
-                # 任务车路径为空但未到目标（被重规划耗尽）→ 重新求路，
-                # 否则会变成永久静止的"僵尸"
-                if not v.path:
-                    task = self.tasks[v.task_id]
-                    goal = (
-                        task.pickup if task.state == E.K_ASSIGNED
-                        else task.dropoff
-                    )
-                    if v.cell == goal:
-                        continue  # 已到位，交由 _arrivals 处理
-                    path = self._astar(v, goal)
-                    if path:
-                        v.path = path
-                        self.touch_vehicle(v.id)
-                    else:
-                        self._abandon_task(v, task, "objective unreachable")
-                continue
-            if not v.path:
-                # 到达漫游点 / 让路点 → 清空目标换新目标
-                if v.target is not None and v.cell == v.target:
-                    v.target = None
-                if v.target is not None:
-                    # 路径被重规划耗尽但未到达 → 重试一次，失败则换目标
-                    path = self._astar(v, v.target)
-                    if path:
-                        v.path = path
-                        self.touch_vehicle(v.id)
-                    else:
-                        v.target = None
-                    continue
-                target = self.random_target()
-                if target is None:
-                    continue
-                path = self._astar(v, target)
-                if path is None:
-                    continue
-                v.target = target
-                v.path = path
-                v.state = E.V_IDLE
-                self.touch_vehicle(v.id)
-
-    def random_target(self) -> tuple | None:
-        """漫游目标只落在通道 (FLOOR) 上；拥堵感知时避开货架窄道，
-        减少漫游车流与任务车流的对头相遇 (FR-024)。"""
-        size = self.grid.size
-        for _ in range(8):
-            r = self.rnd.randrange(2, size - 2)
-            c = self.rnd.randrange(2, size - 2)
-            if not self.grid.is_passable(r, c):
-                continue
-            if self.grid.kind_at(r, c) != CellKind.FLOOR:
-                continue
-            if (
-                self.cfg.conflict_optimization and self._in_shelf(r, c)
-            ):
-                continue  # 漫游不进货架区
-            return (r, c)
-        return None
-
-    # ------------------------------------------------------------- 移动
-    def _movement(self, t: int) -> None:
-        vids = list(self.vehicles)
-        self.rnd.shuffle(vids)  # 消除处理顺序偏差
-        for vid in vids:
-            v = self.vehicles[vid]
-            if not v.path:
-                continue
-            nxt = v.path[0]
-            if not self.grid.is_passable(*nxt):
-                # 新增障碍物挡路 → 重规划
-                self._replan(v)
-                continue
-            if self._carrying(v) and nxt in self.tote_cells:
-                # FR-015：带箱车禁入静置料箱格 → 重规划绕行
-                self._replan(v)
-                continue
-            if self.grid.occupant_at(*nxt) is not None:
-                v.state = E.V_WAITING
-                v.stall_ticks += 1
-                if v.stall_ticks == self.cfg.stall_threshold:
-                    v.state = E.V_STALLED
-                    self.push_event(
-                        "stall_detected", vehicle_id=vid,
-                        detail=f"blocked at {v.cell}",
-                    )
-                self.touch_vehicle(vid)
-                continue
-            if not self.reservations.claim(nxt[0], nxt[1], t, vid):
-                v.state = E.V_WAITING
-                v.stall_ticks += 1
-                if v.stall_ticks == self.cfg.stall_threshold:
-                    v.state = E.V_STALLED
-                    self.push_event(
-                        "stall_detected", vehicle_id=vid,
-                        detail=f"reserved conflict at {v.cell}",
-                    )
-                self.touch_vehicle(vid)
-                continue
-            self._do_move(v, nxt, t)
-
-        for v in self.vehicles.values():
-            if not v.path and v.making_way:
-                v.making_way = False  # sidestep 完成（任务车随后由 _wander 重归正途）
-                v.state = E.V_IDLE
-                self.touch_vehicle(v.id)
-
-    def _do_move(self, v: E.Vehicle, nxt: tuple, t: int) -> None:
-        old = v.cell
-        dr, dc = nxt[0] - old[0], nxt[1] - old[1]
-        v.facing = FACING.get((dr, dc), v.facing)
-        self.grid.set_occupant(old[0], old[1], None)
-        self.grid.set_occupant(nxt[0], nxt[1], v.id)
-        v.cell = nxt
-        v.path.pop(0)
-        if v.stall_ticks >= self.cfg.stall_threshold:
-            self.push_event(
-                "stall_recovered", vehicle_id=v.id, detail="resumed moving",
-            )
-        v.stall_ticks = 0
-        v.state = self._drive_state(v)
-        self._moves[v.id] = (old, nxt)
-        self._touched_vehicles.add(v.id)
-
-    def _drive_state(self, v: E.Vehicle) -> str:
-        if v.making_way:
-            return E.V_MAKING_WAY
-        if v.task_id is not None:
-            task = self.tasks[v.task_id]
-            return (
-                E.V_TO_PICKUP if task.state == E.K_ASSIGNED else E.V_TO_DROPOFF
-            )
-        return E.V_IDLE
-
-    def _replan(self, v: E.Vehicle) -> None:
-        target = v.target
-        if target is None or not self.grid.is_passable(*target):
-            target = self.random_target()
-        if target is None:
-            return
-        path = self._astar(v, target)
-        v.path = path or []
-        self._touched_vehicles.add(v.id)
-
-    # ------------------------------------------------------------- 到站装卸
-    def _arrivals(self) -> None:
-        for v in list(self.vehicles.values()):
-            if v.path or v.task_id is None:
-                continue
-            task = self.tasks[v.task_id]
-            if v.cell == task.pickup:
-                self._pickup(v, task)
-            elif v.cell == task.dropoff and task.state == E.K_IN_PROGRESS:
-                self._dropoff(v, task)
-
-    def _pickup(self, v: E.Vehicle, task: E.Task) -> None:
-        tote = self.totes[task.tote_id]
-        claimable = tote.claimed_by_task in (None, task.id)
-        if (
-            tote.state == E.T_DOCKED
-            and tote.location == task.pickup
-            and claimable
-        ):
-            tote.claimed_by_task = task.id
-            tote.state = E.T_CARRIED
-            tote.carried_by = v.id
-            task.state = E.K_IN_PROGRESS
-            self.tote_cells.discard(tote.location)
-            path = self._astar(v, task.dropoff)
+        attempts = 0
+        for v in self.dispatcher.assignable_vehicles(self.vehicles):
+            if attempts >= 3:  # 每 tick 限流尝试，避免不可达任务拖垮派单
+                break
+            task = self.dispatcher.peek_task()
+            if task is None:
+                break
+            attempts += 1
+            path = self.planner.plan(v.cell, task.pickup, v.facing, False,
+                                     self.occupied_by_others(v.id), max_nodes=60_000)
             if path is None:
-                self._abandon_task(v, task, "dropoff unreachable")
-                return
-            v.state = E.V_TO_DROPOFF
-            v.target = task.dropoff
+                if task.state != TaskState.BLOCKED:
+                    task.state = TaskState.BLOCKED
+                    events.append({"kind": "task_blocked", "task_id": task.id})
+                self.dispatcher.rotate_task(task)  # 移到队尾，障碍物变更后自动重试
+                continue
+            self.dispatcher.take_task(task)
+            task.assigned_vehicle = v.id
+            v.assigned_count += 1
+            self._parked_ok.discard(v.cell)
+            v.task = task
             v.path = path
-            self._touched_totes.add(tote.id)
-            self.touch_vehicle(v.id)
-        else:
-            self._abandon_task(v, task, "tote missing at pickup")
+            v.state = VehicleState.TO_PICKUP
+            changed_v.add(v.id)
+            active += 1
+            if active >= cfg.MAX_ACTIVE_TASKS:
+                break
 
-    def _dropoff(self, v: E.Vehicle, task: E.Task) -> None:
-        tote = self.totes[task.tote_id]
-        tote.state = (
-            E.T_CYCLING if task.type == E.OUTBOUND else E.T_DOCKED
-        )
-        tote.location = v.cell
-        tote.carried_by = None
-        tote.claimed_by_task = None
-        if task.type == E.INBOUND:
-            self.tote_cells.add(v.cell)  # 入库料箱落位 → 带箱车禁入
-        if task.type == E.OUTBOUND:
-            tote.cycle_timer = self.cfg.cycling_ticks
-            self.grid.release_claim(*task.dropoff, task.id)
-        else:
-            self.grid.release_claim(*task.dropoff, task.id)
-        task.state = E.K_DONE
-        self.stats["tasks_done"][task.type] += 1
-        v.task_id = None
-        v.completed += 1
-        v.target = None
-        v.path = []
-        v.state = E.V_IDLE
-        self._touched_totes.add(tote.id)
-        self.touch_vehicle(v.id)
+    # ---- 路径规划（限流）----
 
-    def _abandon_task(self, v: E.Vehicle, task: E.Task, reason: str) -> None:
-        """取货失败：释放声明，入库任务改挂其他料箱或取消重生成。"""
-        self.grid.release_claim(*task.dropoff, task.id)
-        tote = self.totes[task.tote_id]
-        if tote.claimed_by_task == task.id:
-            tote.claimed_by_task = None
-
-        if task.type == E.INBOUND and "tote missing" in reason:
-            alt = self.pick_inbound_tote()
-            if alt is not None:
-                task.tote_id = alt.id
-                task.pickup = alt.location
-                self.task_queue.append(task.id)
-                self.push_event(
-                    "task_retry",
-                    detail=f"task {task.id} retargeted to tote {alt.id}",
-                )
-                v.task_id = None
-                v.state = E.V_IDLE
-                v.target = None
-                v.path = []
-                self.touch_vehicle(v.id)
-                return
-            self.stats["tasks_cancelled"] = (
-                self.stats.get("tasks_cancelled", 0) + 1
-            )
-            self.tasks[task.id].state = E.K_DONE  # 取消闭环，由生成侧补对
-            self.push_event("task_retry",
-                            detail=f"task {task.id} cancelled: {reason}")
-        else:
-            task.state = E.K_QUEUED
-            self.task_queue.append(task.id)
-            self.push_event("task_retry", detail=f"task {task.id}: {reason}")
-        v.task_id = None
-        v.state = E.V_IDLE
-        v.target = None
-        v.path = []
-        self.touch_vehicle(v.id)
-
-    # ------------------------------------------------------------- 料箱循环
-    def _cycling(self) -> None:
-        for tote in self.totes.values():
-            if tote.state != E.T_CYCLING:
-                continue
-            tote.cycle_timer -= 1
-            if tote.cycle_timer > 0:
-                continue
-            cell = self.free_inbound_cell()
-            if cell is None:
-                tote.cycle_timer = 0  # 入库口满，下 tick 再试
-                continue
-            tote.state = E.T_DOCKED
-            tote.location = cell
-            tote.cycle_timer = 0
-            self.tote_cells.add(cell)
-            self.stats["totes_recycled"] += 1
-            self._touched_totes.add(tote.id)
-
-    # ================================================================ 资源选择
-    def _tote_at(self, cell: tuple) -> E.Tote | None:
-        for tote in self.totes.values():
-            if tote.location == cell and tote.state in (E.T_DOCKED, E.T_CYCLING):
-                return tote
-        return None
-
-    def _heat_around(self, cell: tuple) -> float:
-        """点位周边通道的等待热力（拥堵感知选点用）。"""
-        r, c = cell
-        return sum(
-            self.wait_heat.get((r + dr, c + dc), 0.0)
-            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))
-        )
-
-    def _shelf_edge_dist(self, cell: tuple) -> int:
-        """格子到货架区最近边缘的圈距（外圈为 0/1）。"""
-        r0, r1 = self.cfg.shelf_row_range
-        c0, c1 = self.cfg.shelf_col_range
-        r, c = cell
-        return min(r - r0, r1 - r, c - c0, c1 - c)
-
-    def _prefer_low_heat(self, cells: list) -> list:
-        """拥堵感知：优先在热力较低的一半候选中随机 (FR-024)。"""
-        if not self.cfg.conflict_optimization or len(cells) <= 4:
-            return cells
-        ranked = sorted(cells, key=lambda s: self._heat_around(s))
-        return ranked[: max(1, len(ranked) // 2)]
-
-    def pick_outbound_tote(self) -> E.Tote | None:
-        cands = [
-            t for t in self.totes.values()
-            if t.state == E.T_DOCKED and t.claimed_by_task is None
-            and self.grid.kind_at(*t.location) == CellKind.SLOT
-            and self.grid.is_passable(*t.location)
-        ]
-        if not cands:
-            return None
-        loc = self.rnd.choice(self._prefer_low_heat([t.location for t in cands]))
-        return next(t for t in cands if t.location == loc)
-
-    def pick_inbound_tote(self) -> E.Tote | None:
-        cands = [
-            t for t in self.totes.values()
-            if t.state == E.T_DOCKED and t.claimed_by_task is None
-            and self.grid.kind_at(*t.location) == CellKind.INBOUND
-            and self.grid.is_passable(*t.location)
-        ]
-        return self.rnd.choice(cands) if cands else None
-
-    def pick_free_slot(self) -> tuple | None:
-        occupied = {t.location for t in self.totes.values()}
-        cands = [
-            s for s in self.grid.slots
-            if s not in occupied and s not in self.grid.claims
-            and self.grid.is_passable(*s)
-        ]
-        return self.rnd.choice(self._prefer_low_heat(cands)) if cands else None
-
-    def pick_free_outbound_cell(self) -> tuple | None:
-        cands = [
-            c for c in self.grid.outbound_cells
-            if c not in self.grid.claims
-            and self._tote_at(c) is None
-            and self.grid.is_passable(*c)
-        ]
-        return self.rnd.choice(cands) if cands else None
-
-    def free_inbound_cell(self) -> tuple | None:
-        occupied = {t.location for t in self.totes.values()}
-        for cell in self.grid.inbound_cells:
-            if (
-                cell not in occupied
-                and self.grid.is_passable(*cell)
-                and self.grid.occupant_at(*cell) is None
-            ):  # 不得把循环料箱落在车辆头顶 (FR-015)
-                return cell
-        return None
-
-    def free_adjacent(self, cell: tuple, avoid_totes: bool = False) -> tuple | None:
-        r, c = cell
-        opts = []
-        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nr, nc = r + dr, c + dc
-            if (
-                self.grid.is_passable(nr, nc)
-                and self.grid.occupant_at(nr, nc) is None
-                and not (avoid_totes and (nr, nc) in self.tote_cells)
-            ):
-                opts.append((nr, nc))
-        return self.rnd.choice(opts) if opts else None
-
-    # ================================================================ 任务
-    def create_task(self, type_: str, pickup: tuple, dropoff: tuple,
-                    tote: E.Tote) -> E.Task | None:
-        if not self.grid.claim(dropoff[0], dropoff[1], self._next_task_id):
-            return None
-        task = E.Task(
-            id=self._next_task_id, type=type_,
-            pickup=tuple(pickup), dropoff=tuple(dropoff), tote_id=tote.id,
-        )
-        self._next_task_id += 1
-        if type_ == E.OUTBOUND:
-            # 出库：生成时即锁定料箱，防止被其他任务抢走
-            tote.claimed_by_task = task.id
-        # 入库：料箱在取货时才认领（保持入库口料箱池可流动，
-        # 否则生成即锁死会卡住任务生成节奏）
-        self.tasks[task.id] = task
-        self.task_queue.append(task.id)
-        self.stats["tasks_generated"][type_] += 1
-        return task
-
-    # ================================================================ 障碍物
-    def add_obstacle(self, r: int, c: int) -> bool:
-        self.grid.can_obstruct(r, c)
-        if (r, c) in self.grid.obstacles:
-            return False  # 幂等
-        if self.grid.occupant_at(r, c) is not None:
-            raise ObstacleError("cell occupied by vehicle")
-        if (
-            self.grid.kind_at(r, c) == CellKind.SLOT
-            and self._tote_at((r, c)) is not None
-        ):
-            raise ObstacleError("slot holds a tote")
-        self.grid.add_obstacle(r, c)
-        # 受影响车辆（剩余路径即将经过）立即重规划
+    def _plan_paths(self, changed_v: set[int]):
+        budget = 8  # 每 tick 最多规划/重规划的车数（CPU 限流，R2/R9）
         for v in self.vehicles.values():
-            if (r, c) in v.path[:6]:
-                self._replan(v)
-                self.touch_vehicle(v.id)
+            if budget <= 0:
+                break
+            if v.path or v.state not in (VehicleState.TO_PICKUP, VehicleState.TO_DROPOFF,
+                                         VehicleState.TO_CHARGE, VehicleState.MAKING_WAY,
+                                         VehicleState.WAITING):
+                continue
+            # 规划失败冷却：每车 5 tick 内不重复尝试（高拥塞下防规划风暴）
+            if self.tick_n - self._plan_fail_tick.get(v.id, -10**9) < 5:
+                continue
+            goal = self._current_goal(v)
+            if goal is None:
+                continue
+            carrying = v.carrying is not None
+            path = self.planner.plan(v.cell, goal, v.facing, carrying,
+                                     self.occupied_by_others(v.id), max_nodes=50_000)
+            if path is not None:
+                v.path = path
+                self._plan_fail_tick.pop(v.id, None)
+                if v.state == VehicleState.WAITING:  # 重规划成功，恢复原状态
+                    v.state = v.prev_state or VehicleState.TO_PICKUP
+                    v.prev_state = None
+                changed_v.add(v.id)
+                budget -= 1
+            else:
+                self._plan_fail_tick[v.id] = self.tick_n
+
+    def _current_goal(self, v: Vehicle) -> Optional[Cell]:
+        st = v.state
+        if st == VehicleState.TO_PICKUP and v.task:
+            return v.task.pickup
+        if st == VehicleState.TO_DROPOFF and v.task:
+            return v.task.dropoff
+        if st == VehicleState.TO_CHARGE:
+            return v.charge_target
+        if st == VehicleState.MAKING_WAY:
+            return v.way_target
+        return None
+
+    # ---- 移动执行（FR-005/006，R1 预约仲裁）----
+
+    def _move_vehicles(self, changed_v: set[int], changed_t: set[int],
+                       events: list[dict]):
+        self.reservations.clear()
+        # 公平仲裁：等待最久者优先预约（防饿死）；WAITING 车每 tick 重试
+        movers = [v for v in self.vehicles.values()
+                  if v.path and v.state not in (VehicleState.IDLE,
+                                                VehicleState.CHARGING,
+                                                VehicleState.STALLED)]
+        movers.sort(key=lambda v: (-v.stall_ticks, v.id))
+        for v in movers:
+            nxt = v.path[0]
+            # 障碍物/围墙校验（FR-011：绝不驶入障碍格）
+            if not self.planner.can_enter(nxt, v.carrying is not None):
+                v.path = []  # 触发重规划
+                continue
+            other = self.occupant.get(nxt)
+            if other is not None and other != v.id:
+                if v.state != VehicleState.WAITING:
+                    v.prev_state = v.state
+                v.state = VehicleState.WAITING
+                v.wait_reason = other
+                self._wait_graph[v.id] = other
+                continue
+            if not self.reservations.try_reserve(nxt, v.id):
+                owner = self.reservations.owner(nxt)
+                if v.state != VehicleState.WAITING:
+                    v.prev_state = v.state
+                v.state = VehicleState.WAITING
+                v.wait_reason = owner
+                if owner:
+                    self._wait_graph[v.id] = owner
+                continue
+            # 执行移动（一 tick 一格）
+            del self.occupant[v.cell]
+            v.render_from = v.cell
+            v.cell = nxt
+            v.path.pop(0)
+            self.occupant[nxt] = v.id
+            dr, dc = nxt[0] - v.render_from[0], nxt[1] - v.render_from[1]
+            v.facing = {(0, 1): "E", (0, -1): "W", (1, 0): "S", (-1, 0): "N"}.get(
+                (dr, dc), v.facing)
+            # 电量消耗（FR-025：空载 1 点/格，载货 1.5 点/格）
+            v.battery = max(0.0, v.battery - (cfg.LOAD_FACTOR if v.carrying else 1.0))
+            v.stall_ticks = 0
+            v.moved_this_tick = True
+            if v.state == VehicleState.WAITING:
+                v.state = v.prev_state or VehicleState.TO_PICKUP
+                v.prev_state = None
+                v.wait_reason = None
+            changed_v.add(v.id)
+            if v.carrying is not None:
+                changed_t.add(v.carrying.id)
+        # 未移动的 mover 恢复计时
+        for v in movers:
+            if not v.moved_this_tick:
+                v.stall_ticks += 1
+            v.moved_this_tick = False
+
+    # ---- 到达处理 ----
+
+    def _handle_arrivals(self, changed_v: set[int], changed_t: set[int],
+                         events: list[dict]):
+        for v in self.vehicles.values():
+            if v.path or not v.is_moving_state():
+                continue
+            if v.state == VehicleState.MAKING_WAY:
+                # 让路完成：恢复让路前活动（idle 待命 / 继续原任务 / 继续充电行程）
+                tgt = v.way_target
+                v.way_target = None
+                v.state = v.prev_state or VehicleState.IDLE
+                v.prev_state = None
+                v.path = []  # 恢复的任务由 _plan_paths 重新规划
+                if tgt is not None and self.grid.is_slot(tgt):
+                    self._parked_ok.add(v.cell)  # 靠边停好（不占通道）
+                changed_v.add(v.id)
+                continue
+            if v.state == VehicleState.TO_CHARGE:
+                self._arrive_charge(v, changed_v)
+                continue
+            task = v.task
+            if task is None:
+                v.state = VehicleState.IDLE
+                changed_v.add(v.id)
+                continue
+            if v.state == VehicleState.TO_PICKUP and v.cell == task.pickup:
+                self._pickup(v, task, changed_t, changed_v)
+            elif v.state == VehicleState.TO_DROPOFF and v.cell == task.dropoff:
+                self._dropoff(v, task, changed_t, changed_v, events)
+
+    def _pickup(self, v: Vehicle, task: Task, changed_t: set[int], changed_v: set[int]):
+        if task.type == "outbound":
+            tote = self.totes.get(task.tote_id)
+            if tote is None or tote.location != v.cell:
+                # 料箱不在（异常）：任务回收
+                self.dispatcher.unassign(task)
+                v.task = None
+                v.state = VehicleState.IDLE
+                changed_v.add(v.id)
+                return
+            self.docked_cells.discard(v.cell)
+            tote.location = ("carried", v.id)
+            tote.state = ToteState.CARRIED
+            v.carrying = tote
+        else:  # inbound：从入库口池领取循环料箱
+            if not self.inbound_pool:
+                return  # 池暂空：在库口等待循环料箱回归（不退单）
+            tid = self.inbound_pool.popleft()
+            tote = self.totes[tid]
+            tote.location = ("carried", v.id)
+            tote.state = ToteState.CARRIED
+            task.tote_id = tid
+            v.carrying = tote
+        changed_t.add(v.carrying.id)
+        v.state = VehicleState.TO_DROPOFF
+        task.state = TaskState.IN_PROGRESS
+        changed_v.add(v.id)
+
+    def _dropoff(self, v: Vehicle, task: Task, changed_t: set[int],
+                 changed_v: set[int], events: list[dict]):
+        tote = v.carrying
+        if tote is not None:
+            if task.type == "outbound":
+                tote.location = "outbound"
+                tote.state = ToteState.CYCLING
+                self.cycling.append((tote.id, self.tick_n + cfg.TICK_RATE * 5))
+            else:
+                tote.location = task.dropoff
+                tote.state = ToteState.DOCKED
+                self.docked_cells.add(task.dropoff)
+            changed_t.add(tote.id)
+            v.carrying = None
+        task.state = TaskState.DONE
+        v.task = None
+        v.completed_count += 1
+        self.metrics_tasks_done += 1
+        v.state = VehicleState.IDLE
+        changed_v.add(v.id)
+        self.dispatcher.release_claims(task)
+        # FR-025：完成任务瞬间若需充电 → 派发充电行程（优先于新任务）
+        if v.need_charge and v.battery < cfg.battery_low():
+            self._start_charge_trip(v, changed_v, events)
+
+    # ---- 充电（FR-025/026，R10）----
+
+    def _start_charge_trip(self, v: Vehicle, changed_v: set[int],
+                           events: list[dict]):
+        pile = self.charging.free_pile()
+        if pile is None:
+            # 桩满 → 排队格等待（电量更低者优先出队）
+            target = self.charging.assign_queue_cell(
+                v, set(self.occupant) - {v.cell})
+            if target is None:
+                return  # 排队格也满：留在原地稍后再试
+            v.state = VehicleState.TO_CHARGE
+            v.charge_target = target
+            self.charging.enqueue(v.id, v.battery)
+            changed_v.add(v.id)
+            return
+        path = self.planner.plan_any_dir(v.cell, pile, False,
+                                         self.occupied_by_others(v.id))
+        if path is None:
+            return  # 暂不可达：下 tick 重试（pile 未被认领）
+        self.area_claim_pile(pile, v.id)
+        v.state = VehicleState.TO_CHARGE
+        v.charge_target = pile
+        v.path = path
+        changed_v.add(v.id)
+
+    def area_claim_pile(self, pile: Cell, vid: int):
+        self.grid.charging.pile_owner[pile] = vid
+
+    def _release_pile_claim(self, v: Vehicle):
+        """释放该车认领的充电位（如有）。"""
+        tgt = v.charge_target
+        if tgt is not None and self.grid.charging.pile_owner.get(tgt) == v.id:
+            self.grid.charging.pile_owner[tgt] = None
+
+    def _arrive_charge(self, v: Vehicle, changed_v: set[int]):
+        pile = self.charging.at_pile(v)
+        if pile is not None and v.cell == pile:
+            v.state = VehicleState.CHARGING
+            changed_v.add(v.id)
+            return
+        if v.cell in self.grid.charging.queue_cells:
+            # 在排队格等待分配充电位（出队由 _charge_queue_scheduling 驱动）
+            v.state = VehicleState.WAITING
+            v.prev_state = VehicleState.TO_CHARGE
+            changed_v.add(v.id)
+            return
+        # 未到目标（被挤开等）：重试
+        v.path = []
+
+    def _charge_progress(self, changed_v: set[int], changed_t: set[int],
+                         events: list[dict]):
+        for v in self.vehicles.values():
+            if v.state != VehicleState.CHARGING:
+                continue
+            if self.charging.charge_tick(v):
+                pile = self.charging.at_pile(v)
+                if pile is not None:
+                    self.grid.charging.pile_owner[pile] = None
+                v.need_charge = False
+                v.charge_target = None
+                v.state = VehicleState.IDLE
+                events.append({"kind": "charge_done", "vehicle_id": v.id})
+                changed_v.add(v.id)
+
+    def _charge_queue_scheduling(self, changed_v: set[int], events: list[dict]):
+        while True:
+            got = self.charging.dequeue_for_pile(
+                {v.id: v.battery for v in self.vehicles.values()})
+            if got is None:
+                break
+            vid, pile = got
+            v = self.vehicles.get(vid)
+            if v is None or not v.need_charge or v.state == VehicleState.CHARGING:
+                continue
+            # 先释放该车此前认领的充电位（防重复认领）
+            self._release_pile_claim(v)
+            path = self.planner.plan_any_dir(v.cell, pile, False,
+                                             self.occupied_by_others(v.id))
+            if path is None:
+                self.charging.area.queue.insert(0, vid)  # 暂不可达：回队
+                break
+            self.area_claim_pile(pile, vid)
+            v.charge_target = pile
+            v.state = VehicleState.TO_CHARGE
+            v.prev_state = None
+            v.path = path
+            changed_v.add(v.id)
+
+    # ---- 料箱循环（FR-018）----
+
+    def _cycling_advance(self, changed_t: set[int]):
+        remaining = []
+        for tid, ready in self.cycling:
+            if self.tick_n >= ready:
+                tote = self.totes[tid]
+                tote.location = "inbound"
+                tote.state = ToteState.DOCKED
+                self.inbound_pool.append(tid)
+                changed_t.add(tid)
+            else:
+                remaining.append((tid, ready))
+        self.cycling = remaining
+
+    # ↑ cycling 料箱回到入库口（location="inbound"），不占用 slot，无需更新 docked_cells
+
+    # ---- 电量标记与状态清理（FR-025/026）----
+
+    def _need_charge_flags(self, changed_v: set[int], events: list[dict]):
+        for v in self.vehicles.values():
+            low = v.battery < cfg.battery_low()
+            if low and not v.need_charge:
+                v.need_charge = True
+                # 空闲车立即出发；执行任务的车等任务完成（_dropoff 触发）
+                if v.state == VehicleState.IDLE:
+                    self._start_charge_trip(v, changed_v, events)
+            # 兜底（FR-026/SC-010）：电量临界仍未充电 → 放弃当前等待，直接去充电
+            # 载货车：就地落箱（任务起点更新后重派），保证任何车辆不电量归零
+            if (v.battery < cfg.battery_critical()
+                    and v.state not in (VehicleState.CHARGING, VehicleState.TO_CHARGE)):
+                if v.carrying is not None:
+                    if self._drop_tote_here(v) and v.task is not None:
+                        v.task.pickup = v.cell
+                        v.assigned_count = max(0, v.assigned_count - 1)
+                        self.dispatcher.unassign(v.task)
+                        v.task.assigned_vehicle = None
+                    v.task = None
+                elif v.task is not None:
+                    v.assigned_count = max(0, v.assigned_count - 1)
+                    self.dispatcher.unassign(v.task)
+                    v.task.assigned_vehicle = None
+                    v.task = None
+                self._release_pile_claim(v)
+                if v.id in self.grid.charging.queue:
+                    self.grid.charging.queue.remove(v.id)
+                v.state = VehicleState.IDLE
+                v.prev_state = None
+                v.way_target = None
+                v.stall_ticks = 0
+                self._start_charge_trip(v, changed_v, events)
+                changed_v.add(v.id)
+            # 状态清理：无处可等的 WAITING 僵尸（无路径、不在充电排队）→ 回 idle
+            if (v.state == VehicleState.WAITING and not v.path
+                    and not (v.cell in self.grid.charging.queue_cells and v.need_charge)):
+                v.state = VehicleState.IDLE
+                v.prev_state = None
+                changed_v.add(v.id)
+            # 不变量自愈：idle 车不应携带料箱
+            if v.state == VehicleState.IDLE and v.carrying is not None:
+                if v.task is not None and v.task.state == TaskState.IN_PROGRESS:
+                    v.state = VehicleState.TO_DROPOFF  # 继续送货
+                elif self._drop_tote_here(v):
+                    v.task = None
+                changed_v.add(v.id)
+            # FR-028 待命靠边：idle 车停在通道上会堵窄道 → 主动挪到最近空点位格
+            # （无载车可停在静置料箱格下方，FR-015；让出 1 格宽通道减少死锁）
+            if (v.state == VehicleState.IDLE and not v.path
+                    and v.cell not in self._parked_ok
+                    and self.grid.kind.get(v.cell) == CellKind.FLOOR
+                    and not self.grid.in_charging_area(v.cell)):
+                self._try_park_aside(v, changed_v)
+
+    def _drop_tote_here(self, v: Vehicle) -> bool:
+        """就地落箱（料箱落于当前格，变为静置）。"""
+        cell = v.cell
+        k = self.grid.kind.get(cell)
+        if (cell in self.grid.obstacles or self._tote_at(cell)
+                or k not in (CellKind.FLOOR, CellKind.SLOT)
+                or cell in self.grid.charging.pile_owner):
+            return False
+        tote = v.carrying
+        tote.location = cell
+        tote.state = ToteState.DOCKED
+        self.docked_cells.add(cell)
+        v.carrying = None
         return True
 
-    def remove_obstacle(self, r: int, c: int) -> bool:
-        changed = self.grid.remove_obstacle(r, c)  # 不存在时抛 ObstacleError
-        if changed:
-            self.dispatcher.unblock_all(self)
-        return changed
+    def _try_park_aside(self, v: Vehicle, changed_v: set[int]):
+        """空闲车就近挪到存储点位格待命（不占通道，FR-028 靠边待命）。"""
+        if self.tick_n - self._park_try_tick.get(v.id, -10**9) < 30:
+            return  # 冷却，防反复尝试
+        self._park_try_tick[v.id] = self.tick_n
+        r, c = v.cell
+        for radius in (1, 2, 3):
+            best = None
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    cand = (r + dr, c + dc)
+                    if (self.grid.is_slot(cand) and cand not in self.occupant
+                            and cand not in self.grid.blocked):
+                        best = cand
+                        break
+                if best:
+                    break
+            if best is None:
+                continue
+            path = self.planner.plan(v.cell, best, v.facing, False,
+                                     self.occupied_by_others(v.id), max_nodes=20_000)
+            if path:
+                v.state = VehicleState.MAKING_WAY
+                v.way_target = best
+                self._parked_ok.discard(v.cell)  # 原车位让出
+                v.path = path
+                changed_v.add(v.id)
+                return
+        return
 
-    # ================================================================ 输出
-    def push_event(self, kind: str, vehicle_id: int | None = None,
-                   detail: str = "") -> None:
-        evt = {
-            "type": "event", "tick": self.tick, "kind": kind,
-            "vehicle_id": vehicle_id, "detail": detail,
+    # ---- 死锁检测与恢复（FR-012，research.md R3）----
+
+    def _deadlock_detection(self, changed_v: set[int], events: list[dict]):
+        for v in self.vehicles.values():
+            if v.stall_ticks < cfg.STALL_TICKS:
+                continue
+            if v.state != VehicleState.STALLED:
+                if v.prev_state is None:  # 保留既有的恢复点（如让路前状态）
+                    v.prev_state = v.state
+                v.state = VehicleState.STALLED
+                events.append({"kind": "stall_detected", "vehicle_id": v.id})
+                changed_v.add(v.id)
+            self._try_recover(v, changed_v, events)
+
+    def _try_recover(self, v: Vehicle, changed_v: set[int], events: list[dict]):
+        """恢复阶梯（R3-3）：重规划 → 让路 → 改派。每车冷却 20 tick 限流。"""
+        last = self._recover_cooldown.get(v.id, -10**9)
+        if self.tick_n - last < 20:
+            return
+        self._recover_cooldown[v.id] = self.tick_n
+        # a) 重规划绕行：仅当找到与当前不同的可行路径才算成功
+        #    （规划器允许终点被他车占据，若结果与现状相同则继续让路/改派）
+        goal = self._current_goal(v)
+        if goal is not None and goal != v.cell:
+            path = self.planner.plan(v.cell, goal, v.facing, v.carrying is not None,
+                                     self.occupied_by_others(v.id), max_nodes=40_000)
+            if path is not None and path != v.path:
+                v.path = path
+                v.state = v.prev_state or VehicleState.TO_PICKUP
+                v.prev_state = None
+                v.way_target = None
+                v.stall_ticks = 0
+                events.append({"kind": "stall_recovered", "vehicle_id": v.id,
+                               "detail": "rerouted"})
+                changed_v.add(v.id)
+                return
+        # b) 让路：请挡路的空闲/等待/受阻车移向邻近空格
+        blocker = self.occupant.get(goal) if goal else None
+        if blocker is None and v.path:
+            blocker = self.occupant.get(v.path[0])
+        blocker = blocker or v.wait_reason
+        bv = self.vehicles.get(blocker or 0)
+        if bv is not None and bv.id != v.id and \
+                bv.state in (VehicleState.IDLE, VehicleState.WAITING,
+                             VehicleState.STALLED):
+            if self._make_way(bv, changed_v):
+                events.append({"kind": "stall_recovered", "vehicle_id": v.id,
+                               "detail": f"vehicle {bv.id} making way"})
+                return
+        # c) 改派：任务回收重派；无任务车（充电/让路途中）取消当前行程回 idle
+        if v.task is not None:
+            if v.carrying is not None:
+                # 载货受阻：就地落箱（料箱落格、任务起点更新后重派），
+                # 严禁带着料箱去执行新任务（FR-015 载货车不可进静置箱格）
+                if self._drop_tote_here(v):
+                    v.task.pickup = v.cell  # 任务起点 = 料箱当前位置
+                    v.assigned_count = max(0, v.assigned_count - 1)
+                    self.dispatcher.unassign(v.task)
+                    v.task.assigned_vehicle = None
+                    v.task = None
+                    v.state = VehicleState.IDLE
+                    v.stall_ticks = 0
+                    events.append({"kind": "stall_recovered", "vehicle_id": v.id,
+                                   "detail": "tote dropped, task reassigned"})
+                    changed_v.add(v.id)
+                # 当前格不可落箱（桩位/站点/已有箱）：保持受阻，等待下轮恢复
+                return
+            v.assigned_count = max(0, v.assigned_count - 1)
+            self.dispatcher.unassign(v.task)
+            v.task = None
+            v.state = VehicleState.IDLE
+            v.stall_ticks = 0
+            events.append({"kind": "stall_recovered", "vehicle_id": v.id,
+                           "detail": "task reassigned"})
+            changed_v.add(v.id)
+        else:
+            # 充电/让路行程不可达：取消行程（need_charge 保留，稍后重试）
+            self._release_pile_claim(v)
+            if v.id in self.grid.charging.queue:
+                self.grid.charging.queue.remove(v.id)
+            v.charge_target = None
+            v.state = VehicleState.IDLE
+            v.stall_ticks = 0
+            events.append({"kind": "stall_recovered", "vehicle_id": v.id,
+                           "detail": "trip cancelled"})
+
+    def _make_way(self, v: Vehicle, changed_v: set[int]) -> bool:
+        """空闲/等待车短距离避让（FR-028 例外移动）。"""
+        for cand in self._neighbors(v.cell):
+            if (self.grid.passable(cand) and cand not in self.occupant
+                    and not (self.grid.is_slot(cand) and self._tote_at(cand))):
+                path = self.planner.plan_any_dir(v.cell, cand, False,
+                                                 self.occupied_by_others(v.id))
+                if path:
+                    if v.prev_state is None:
+                        v.prev_state = v.state
+                    v.state = VehicleState.MAKING_WAY
+                    v.way_target = cand
+                    v.path = path
+                    v.stall_ticks = 0
+                    changed_v.add(v.id)
+                    return True
+        return False
+
+    def _neighbors(self, cell: Cell) -> list[Cell]:
+        r, c = cell
+        return [(r - 1, c), (r, c + 1), (r + 1, c), (r, c - 1)]
+
+    # ---- 冲突事件（FR-022）----
+
+    def _conflict_detection(self):
+        """互堵判定：等待关系图中 ≥2 台车成团（含互等环）。"""
+        if not self._wait_graph:
+            clusters = []
+        else:
+            nodes = set(self._wait_graph) | set(self._wait_graph.values())
+            nodes = {n for n in nodes if n in self.vehicles}
+            adj = {n: set() for n in nodes}
+            for a, b in self._wait_graph.items():
+                if a in nodes and b in nodes:
+                    adj[a].add(b)
+                    adj[b].add(a)
+            seen, clusters = set(), []
+            for n in nodes:
+                if n in seen:
+                    continue
+                comp, stack = set(), [n]
+                while stack:
+                    cur = stack.pop()
+                    if cur in comp:
+                        continue
+                    comp.add(cur)
+                    stack.extend(adj[cur] - comp)
+                seen |= comp
+                if len(comp) >= 2:
+                    clusters.append(frozenset(comp))
+        for ev in self._active_conflicts:
+            for cl in clusters:
+                if ev.vehicles and cl & set(ev.vehicles):
+                    ev.vehicles = sorted(set(ev.vehicles) | cl)
+                    break
+        for cl in clusters:
+            if not any(cl & set(ev.vehicles) for ev in self._active_conflicts):
+                vids = sorted(cl)
+                self._active_conflicts.append(ConflictEvent(
+                    start_tick=self.tick_n, vehicles=vids,
+                    positions=[self.vehicles[v].cell for v in vids],
+                    carried=[self.vehicles[v].carrying is not None for v in vids]))
+                vids = sorted(cl)
+                self._active_conflicts.append(ConflictEvent(
+                    start_tick=self.tick_n, vehicles=vids,
+                    positions=[self.vehicles[v].cell for v in vids],
+                    carried=[self.vehicles[v].carrying is not None for v in vids]))
+
+    def _finalize_conflicts(self):
+        active_ids = {v for ev in self._active_conflicts for v in ev.vehicles}
+        waiting = set(self._wait_graph)
+        keep = []
+        for ev in self._active_conflicts:
+            if set(ev.vehicles) & waiting:
+                keep.append(ev)
+                continue
+            ev.end_tick = self.tick_n
+            dur = ev.end_tick - ev.start_tick
+            if dur >= cfg.CONFLICT_MIN_TICKS:
+                self.conflict_events.append(ev)
+                self._update_hotspots(ev)
+                if self._conflict_fh:
+                    self._conflict_fh.write(json.dumps(ev.to_json(), ensure_ascii=False) + "\n")
+                    self._conflict_fh.flush()
+        self._active_conflicts = keep
+
+    # ---- 热点优化（FR-024，research.md R9：与 TURN_PENALTY 正交）----
+
+    HOTSPOT_WEIGHT = 2.0       # 每次冲突事件对涉事格的代价增量
+    HOTSPOT_DECAY_TICKS = 500  # 每 500 tick 衰减一半（滚动适应）
+
+    def _update_hotspots(self, ev: ConflictEvent):
+        if not getattr(cfg, "CONFLICT_OPTIMIZATION", True):
+            return
+        for pos in ev.positions:
+            self.planner.hotspots[pos] = (self.planner.hotspots.get(pos, 0.0)
+                                          + self.HOTSPOT_WEIGHT)
+        # 涉事车辆被堵的目标格也算热点
+        for vid in ev.vehicles:
+            v = self.vehicles.get(vid)
+            if v is not None and v.path:
+                nxt = v.path[0]
+                self.planner.hotspots[nxt] = (self.planner.hotspots.get(nxt, 0.0)
+                                              + self.HOTSPOT_WEIGHT)
+
+    def _decay_hotspots(self):
+        if self.tick_n % self.HOTSPOT_DECAY_TICKS == 0 and self.planner.hotspots:
+            for c in list(self.planner.hotspots):
+                w = self.planner.hotspots[c] * 0.5
+                if w < 0.1:
+                    del self.planner.hotspots[c]
+                else:
+                    self.planner.hotspots[c] = w
+
+    # ---- 快照与增量（契约 rest-api.md / websocket.md）----
+
+    def snapshot(self) -> dict:
+        g = self.grid
+        return {
+            "tick": self.tick_n,
+            "paused": self.paused,
+            "grid": {
+                "size": g.size,
+                "slots": [list(c) for c in g.slots],
+                "inbound": {"rows": list(cfg.INBOUND_ROW_RANGE),
+                            "cols": list(cfg.INBOUND_COL_RANGE)},
+                "outbound": {"rows": list(cfg.OUTBOUND_ROW_RANGE),
+                             "cols": list(cfg.OUTBOUND_COL_RANGE)},
+                "charging_area": {
+                    "piles": [list(c) for c in g.charging.piles],
+                    "entry": [list(c) for c in g.charging.entry_lane],
+                    "exit": [list(c) for c in g.charging.exit_lane]},
+                "obstacles": [list(c) for c in g.obstacles],
+            },
+            "vehicles": [self._vehicle_json(v) for v in self.vehicles.values()],
+            "totes": [{"id": t.id, **self._tote_loc(t), "state": t.state.value}
+                      for t in self.totes.values()],
+            "charging": {
+                "pile_owner": {f"{r},{c}": vid for (r, c), vid in
+                               g.charging.pile_owner.items() if vid is not None},
+                "queue": list(g.charging.queue)},
+            "metrics": self._metrics(),
         }
-        self.events.append(evt)
-        self._pending_events.append(evt)
 
-    def touch_vehicle(self, vid: int) -> None:
-        self._touched_vehicles.add(vid)
+    def _vehicle_json(self, v: Vehicle) -> dict:
+        return {"id": v.id, "cell": list(v.cell), "state": v.state.value,
+                "task_id": v.task.id if v.task else None,
+                "completed": v.completed_count, "battery": int(v.battery)}
 
-    def pop_delta(self) -> dict:
-        vehicles = []
-        for vid in sorted(self._moves.keys() | self._touched_vehicles):
-            v = self.vehicles[vid]
-            entry: dict = {"id": vid, "state": v.state}
-            if vid in self._moves:
-                old, new = self._moves[vid]
-                entry["from"] = list(old)
-                entry["to"] = list(new)
-            else:
-                entry["from"] = list(v.cell)
-                entry["to"] = list(v.cell)
-            vehicles.append(entry)
-        totes = []
-        for tid in sorted(self._touched_totes):
-            t = self.totes[tid]
-            entry = {"id": tid, "state": t.state}
-            if t.state == E.T_CARRIED:
-                entry["carried_by"] = t.carried_by
-            else:
-                entry["at"] = list(t.location)
-            totes.append(entry)
-        delta = {
-            "type": "delta", "tick": self.tick,
-            "vehicles": vehicles, "totes": totes,
-            "metrics": dict(self.metrics),
-        }
-        self._moves.clear()
-        self._touched_vehicles.clear()
-        self._touched_totes.clear()
-        return delta
+    def _tote_loc(self, t: Tote) -> dict:
+        if isinstance(t.location, tuple) and len(t.location) == 2 \
+                and all(isinstance(x, int) for x in t.location):
+            return {"at": list(t.location)}  # type: ignore[arg-type]
+        if isinstance(t.location, tuple):  # ("carried", vid)
+            return {"carried_by": t.location[1]}
+        return {"at": t.location}  # "inbound" / "outbound"
 
-    def pop_events(self) -> list[dict]:
-        out, self._pending_events = self._pending_events, []
-        return out
-
-    def _update_metrics(self) -> None:
-        waiting = sum(
-            1 for v in self.vehicles.values() if v.state == E.V_WAITING
-        )
-        stalled = sum(
-            1 for v in self.vehicles.values() if v.state == E.V_STALLED
-        )
-        done = self.stats["tasks_done"]
-        self.metrics = {
-            "tasks_done": done["inbound"] + done["outbound"],
-            "tasks_done_inbound": done["inbound"],
-            "tasks_done_outbound": done["outbound"],
-            "tasks_queued": sum(
-                1 for t in self.tasks.values() if t.state == E.K_QUEUED
-            ),
+    def _metrics(self) -> dict:
+        waiting = sum(1 for v in self.vehicles.values()
+                      if v.state in (VehicleState.WAITING, VehicleState.STALLED))
+        stalled = sum(1 for v in self.vehicles.values()
+                      if v.state == VehicleState.STALLED)
+        charging = sum(1 for v in self.vehicles.values()
+                       if v.state == VehicleState.CHARGING)
+        return {
+            "tasks_done": self.metrics_tasks_done,
             "waiting": waiting,
             "stalled": stalled,
             "collision": self.collision_count,
-            "conflicts": self.recorder.total_closed,
-            "totes_in_shelf": sum(
-                1 for t in self.totes.values()
-                if t.state == E.T_DOCKED
-                and self.grid.kind_at(*t.location) == CellKind.SLOT
-            ),
-            "per_vehicle_completed": [
-                self.vehicles[i].completed for i in sorted(self.vehicles)
-            ],
+            "charging": charging,
+            "charge_queue": len(self.grid.charging.queue),
+            "avg_battery": round(sum(v.battery for v in self.vehicles.values())
+                                 / max(len(self.vehicles), 1) / cfg.BATTERY_FULL * 100),
+            "per_vehicle_completed": [self.vehicles[i].completed_count
+                                      for i in sorted(self.vehicles)],
         }
-
-    def snapshot(self) -> dict:
-        cfg = self.cfg
-        return {
-            "tick": self.tick,
-            "paused": self.paused,
-            "grid": {
-                "size": self.grid.size,
-                "slots": [list(s) for s in self.grid.slots],
-                "inbound": {
-                    "rows": list(cfg.inbound_row_range),
-                    "cols": list(cfg.inbound_col_range),
-                },
-                "outbound": {
-                    "rows": list(cfg.outbound_row_range),
-                    "cols": list(cfg.outbound_col_range),
-                },
-                "obstacles": [list(o) for o in sorted(self.grid.obstacles)],
-            },
-            "vehicles": [
-                {
-                    "id": v.id, "cell": list(v.cell),
-                    "state": v.state, "task_id": v.task_id,
-                    "completed": v.completed,
-                }
-                for v in sorted(self.vehicles.values(), key=lambda x: x.id)
-            ],
-            "totes": [
-                self.tote_public(t) for t in sorted(
-                    self.totes.values(), key=lambda x: x.id
-                )
-            ],
-            "metrics": dict(self.metrics),
-        }
-
-    @staticmethod
-    def tote_public(t: E.Tote) -> dict:
-        entry = {"id": t.id, "state": t.state}
-        if t.state == E.T_CARRIED:
-            entry["carried_by"] = t.carried_by
-        else:
-            entry["at"] = list(t.location)
-        return entry
 
     def vehicle_detail(self, vid: int) -> dict | None:
         v = self.vehicles.get(vid)
         if v is None:
             return None
-        task = self.tasks.get(v.task_id) if v.task_id else None
-        return {
-            "type": "vehicle_detail",
-            "vehicle": {
-                "id": v.id, "cell": list(v.cell), "state": v.state,
-                "completed": v.completed, "facing": v.facing,
-                "path": [list(p) for p in v.path[:60]],
-                "task": (
-                    {
-                        "id": task.id, "type": task.type,
-                        "pickup": list(task.pickup),
-                        "dropoff": list(task.dropoff),
-                        "state": task.state,
-                    } if task else None
-                ),
-            },
-        }
+        d = self._vehicle_json(v)
+        d["path"] = [list(c) for c in v.path]
+        d["task"] = ({"id": v.task.id, "type": v.task.type,
+                      "pickup": list(v.task.pickup), "dropoff": list(v.task.dropoff),
+                      "state": v.task.state.value} if v.task else None)
+        d["need_charge"] = v.need_charge
+        return d
 
-    # ================================================================ 自检
-    def self_check(self) -> list[str]:
-        """--check 自检：布局、规划器、预约互斥、短程运行。"""
-        checks: list[str] = []
-        cfg = self.cfg
-        n_slots = len(self.grid.slots)
-        n_in = len(self.grid.inbound_cells)
-        n_out = len(self.grid.outbound_cells)
-        exp_slots = (
-            (cfg.shelf_row_range[1] - cfg.shelf_row_range[0] + 1
-             + cfg.slot_row_step - 1) // cfg.slot_row_step
-        ) * (
-            (cfg.shelf_col_range[1] - cfg.shelf_col_range[0] + 1
-             + cfg.slot_col_step - 1) // cfg.slot_col_step
-        )
-        exp_station = (cfg.inbound_row_range[1] - cfg.inbound_row_range[0] + 1) * (
-            cfg.inbound_col_range[1] - cfg.inbound_col_range[0] + 1
-        )
-        assert n_slots == exp_slots, f"slots {n_slots} != {exp_slots}"
-        assert n_in == exp_station and n_out == exp_station
-        assert not self.grid.is_passable(0, 0), "boundary must block"
-        assert not self.grid.is_passable(1, 100), "wall must be 2 cells thick"
-        assert self.grid.is_passable(2, 100), "ring road must be passable"
-        checks.append(
-            f"layout ok (slots={n_slots}, stations={n_in}/{n_out}, "
-            f"wall=2, ring road ok)"
-        )
+    # ---- 障碍物操作（FR-009/010/011，契约 rest-api.md）----
 
-        planner_self_test(self.grid)
-        checks.append("planner ok")
+    def add_obstacle(self, cell: Cell) -> tuple[bool, str]:
+        occupant = self.occupant.get(cell)
+        # 预约占用：已有车将下一步进入该格也视为 reserved（契约 409 语义）
+        if occupant is None and self.reservations.owner(cell) is not None:
+            return False, "cell occupied or reserved"
+        ok, reason = self.grid.can_add_obstacle(cell, occupant,
+                                                self._tote_at(cell))
+        if not ok:
+            return False, reason
+        if self.grid.add_obstacle(cell, self.tick_n):
+            self._pending_events.append({"type": "obstacle_changed",
+                                         "tick": self.tick_n,
+                                         "added": [list(cell)], "removed": []})
+        self._replan_affected(cell)
+        return True, ""
 
-        res = Reservations()
-        assert res.claim(3, 3, 5, 1)
-        assert not res.claim(3, 3, 5, 2), "double reservation must fail"
-        assert res.claim(3, 3, 5, 1), "same vehicle re-claim ok"
-        checks.append("reservations ok")
+    def remove_obstacle(self, cell: Cell) -> bool:
+        if not self.grid.remove_obstacle(cell):
+            return False
+        self._pending_events.append({"type": "obstacle_changed",
+                                     "tick": self.tick_n,
+                                     "added": [], "removed": [list(cell)]})
+        self._replan_affected(cell)
+        return True
 
-        for _ in range(5):
-            self.step()
-        assert self.collision_count == 0
-        seen = set()
-        for r in range(self.grid.size):
-            for c in range(self.grid.size):
-                occ = self.grid.occupant_at(r, c)
-                if occ is not None:
-                    assert occ not in seen, "occupancy invariant broken"
-                    seen.add(occ)
-        checks.append(f"engine ok ({len(self.vehicles)} vehicles, 5 ticks)")
-        return checks
+    def _replan_affected(self, cell: Cell):
+        """FR-011：路径经过该格的车清空路径触发重规划。"""
+        for v in self.vehicles.values():
+            if cell in v.path or v.cell == cell:
+                v.path = []
+
+    def reset(self):
+        """POST /api/reset：重置到初始布局。"""
+        self.tick_n = 0
+        self.paused = False
+        self.collision_count = 0
+        self.metrics_tasks_done = 0
+        self.vehicles.clear()
+        self.totes.clear()
+        self.occupant.clear()
+        self.docked_cells.clear()
+        self.inbound_pool.clear()
+        self.cycling.clear()
+        self.grid.obstacles.clear()
+        self.grid.blocked = {c for c, k in self.grid.kind.items()
+                             if k == CellKind.BOUNDARY}  # 障碍物清空后重建 blocked
+        self.dispatcher = Dispatcher(self.grid, self.rng)
+        self.dispatcher.docked_cells = self.docked_cells
+        self.planner.hotspots.clear()
+        self._recover_cooldown.clear()
+        self._plan_fail_tick.clear()
+        self._park_try_tick.clear()
+        self._parked_ok.clear()
+        self.conflict_events.clear()
+        self._active_conflicts.clear()
+        self._init_world()

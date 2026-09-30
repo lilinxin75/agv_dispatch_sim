@@ -1,65 +1,143 @@
-"""实体数据结构 (data-model.md: Vehicle / Tote / Task)。"""
-
+"""实体数据结构（字段与枚举严格按 data-model.md）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
 
-# --- Vehicle 状态 ---
-V_IDLE = "idle"
-V_TO_PICKUP = "to_pickup"
-V_TO_DROPOFF = "to_dropoff"
-V_WAITING = "waiting"
-V_STALLED = "stalled"
-V_MAKING_WAY = "making_way"
+Cell = tuple[int, int]  # (row, col)，0 起始，(0,0) 左上角
 
-# --- Tote 状态 ---
-T_DOCKED = "docked"      # 静置（存储点位 / 入库口 / 出库口）
-T_CARRIED = "carried"    # 被某车携带
-T_CYCLING = "cycling"    # 出库送达后循环回归中
 
-# --- Task 状态 ---
-K_QUEUED = "queued"
-K_ASSIGNED = "assigned"
-K_IN_PROGRESS = "in_progress"
-K_DONE = "done"
-K_BLOCKED = "blocked"
+class CellKind(str, Enum):
+    BOUNDARY = "boundary"      # 边界围墙，不可通行
+    FLOOR = "floor"            # 通道
+    SLOT = "slot"              # 存储点位
+    INBOUND = "inbound"        # 入库口
+    OUTBOUND = "outbound"      # 出库口
+    CHARGE_PILE = "charge_pile"  # 充电位
+    CHARGE_IN = "charge_in"    # 进站通道（单向）
+    CHARGE_OUT = "charge_out"  # 出站通道（单向）
+    CHARGE_QUEUE = "charge_queue"  # 排队格
 
-# --- Task 类型 ---
-INBOUND = "inbound"      # 入库口 → 存储点位
-OUTBOUND = "outbound"    # 存储点位 → 出库口
+
+class VehicleState(str, Enum):
+    IDLE = "idle"              # 空闲待命（不漫游，FR-028）
+    TO_PICKUP = "to_pickup"    # 前往取货点
+    TO_DROPOFF = "to_dropoff"  # 携带中前往目的点
+    TO_CHARGE = "to_charge"    # 前往充电区
+    CHARGING = "charging"      # 充电中
+    WAITING = "waiting"        # 等待放行
+    STALLED = "stalled"        # 疑似卡死
+    MAKING_WAY = "making_way"  # 让路中
+
+
+class ToteState(str, Enum):
+    DOCKED = "docked"      # 静置
+    CARRIED = "carried"    # 被携带
+    CYCLING = "cycling"    # 循环中（出库口→入库口回归）
+
+
+class TaskState(str, Enum):
+    QUEUED = "queued"
+    ASSIGNED = "assigned"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    BLOCKED = "blocked"    # 终点不可达暂时搁置
 
 
 @dataclass
 class Vehicle:
     id: int
-    cell: tuple[int, int]
-    state: str = V_IDLE
-    task_id: int | None = None
-    completed: int = 0
-    assigned_total: int = 0          # 累计被分配任务数（均匀性指标）
-    path: list = field(default_factory=list)   # 剩余路径 [(r,c), ...]
-    facing: str = "E"
-    stall_ticks: int = 0             # 连续未移动 tick 计数
-    target: tuple | None = None      # 当前移动目标（wander 或任务起/终点）
-    making_way: bool = False         # 让路 sidestep 标记
+    cell: Cell
+    facing: str = "E"                       # N/E/S/W（渲染朝向）
+    state: VehicleState = VehicleState.IDLE
+    task: Optional["Task"] = None
+    completed_count: int = 0                # 仅计搬运任务（均匀性指标）
+    assigned_count: int = 0                 # 累计被分配任务数（FR-004 分配均匀性度量）
+    battery: float = 1000.0                 # 剩余电量点数（BATTERY_FULL）
+    need_charge: bool = False               # 低于低电阈值后置位
+    charge_target: Optional[Cell] = None    # 分配到的充电位（排队期间为空）
+    way_target: Optional[Cell] = None       # 让路目标格（making_way 专用）
+    carrying: Optional["Tote"] = None       # 携带中的料箱
+    path: list[Cell] = field(default_factory=list)  # 剩余路径（不含当前格）
+    stall_ticks: int = 0                    # 连续未移动 tick 计数（死锁检测）
+    prev_state: Optional[VehicleState] = None  # waiting/stalled 恢复后回原状态
+
+    # 渲染插值用
+    render_from: Cell = (0, 0)
+    moved_this_tick: bool = False
+    wait_reason: Optional[int] = None       # 等待因谁（对方 vehicle_id，冲突检测用）
+
+    def is_moving_state(self) -> bool:
+        return self.state in (
+            VehicleState.TO_PICKUP,
+            VehicleState.TO_DROPOFF,
+            VehicleState.TO_CHARGE,
+            VehicleState.MAKING_WAY,
+        )
+
+    def dispatchable(self) -> bool:
+        """是否可参与任务分配（充电中的车不参与，data-model.md Vehicle 规则）。"""
+        return self.state not in (
+            VehicleState.TO_CHARGE,
+            VehicleState.CHARGING,
+            VehicleState.STALLED,
+        )
 
 
 @dataclass
 class Tote:
     id: int
-    location: tuple[int, int]        # 始终为具体格（入库口/出库口/点位）
-    state: str = T_DOCKED
-    carried_by: int | None = None
-    claimed_by_task: int | None = None
-    cycle_timer: int = 0             # T_CYCLING 状态下的剩余 tick
+    # location: (row,col) slot / "inbound" / "outbound" / ("carried", vehicle_id)
+    location: Cell | str | tuple
+    state: ToteState = ToteState.DOCKED
 
 
 @dataclass
 class Task:
     id: int
-    type: str                        # INBOUND / OUTBOUND
-    pickup: tuple[int, int]
-    dropoff: tuple[int, int]
+    type: str                # "inbound" | "outbound"
+    pickup: Cell
+    dropoff: Cell
     tote_id: int
-    state: str = K_QUEUED
-    assigned_vehicle: int | None = None
+    state: TaskState = TaskState.QUEUED
+    assigned_vehicle: Optional[int] = None
+
+
+@dataclass
+class Obstacle:
+    cell: Cell
+    created_at_tick: int = 0
+
+
+@dataclass
+class ChargingArea:
+    piles: list[Cell] = field(default_factory=list)          # 充电位格（N=10）
+    pile_owner: dict[Cell, Optional[int]] = field(default_factory=dict)  # cell -> vehicle_id?
+    entry_lane: list[Cell] = field(default_factory=list)     # 进站单向通道格序列
+    exit_lane: list[Cell] = field(default_factory=list)      # 出站单向通道格序列
+    queue: list[int] = field(default_factory=list)           # 排队 vehicle_id（电量更低者优先出队）
+    queue_cells: list[Cell] = field(default_factory=list)    # 排队格（不占主干道）
+
+
+class ConflictEvent:
+    """互堵冲突事件（FR-022）：≥2 台车相互等待成团。"""
+
+    def __init__(self, start_tick: int, vehicles: list[int], positions: list[Cell],
+                 carried: list[bool]):
+        self.start_tick = start_tick
+        self.end_tick: Optional[int] = None
+        self.vehicles = sorted(set(vehicles))
+        self.positions = positions
+        self.carried = carried  # 涉事车辆有无料箱
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "conflict_event",
+            "start_tick": self.start_tick,
+            "end_tick": self.end_tick,
+            "duration_ticks": (self.end_tick or self.start_tick) - self.start_tick,
+            "vehicles": self.vehicles,
+            "positions": [list(p) for p in self.positions],
+            "carried": self.carried,
+        }

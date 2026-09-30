@@ -1,81 +1,56 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RCS 多车调度演示</title>
-  <link rel="stylesheet" href="style.css" />
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RCS 多车料箱搬运调度演示</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header>
-    <h1>RCS 多车料箱搬运调度演示</h1>
-    <div class="controls">
-      <button id="btn-pause">暂停</button>
-      <button id="btn-resume">恢复</button>
-      <button id="btn-reset">重置</button>
-      <label class="chk"><input type="checkbox" id="show-ids" /> 显示编号</label>
-      <span id="tick-label">tick 0</span>
+<div id="app">
+  <div id="canvas-wrap">
+    <canvas id="cv-static"></canvas>
+    <canvas id="cv-obstacle"></canvas>
+    <canvas id="cv-dynamic"></canvas>
+    <div id="hint">滚轮缩放 · 拖拽平移 · 点击车辆查看详情 / 点击空地添加障碍物</div>
+  </div>
+
+  <div id="toolbar">
+    <button id="btn-pause">暂停</button>
+    <button id="btn-trails" title="显示/隐藏小车移动轨迹尾迹（FR-032）">轨迹:开</button>
+    <button id="btn-reset-view">复位视图</button>
+    <button id="btn-reset-sim" title="重置仿真到初始布局">重置仿真</button>
+    <span id="tick-label">tick 0</span>
+  </div>
+
+  <div id="side">
+    <div class="panel" id="metrics-panel">
+      <h3>运行指标</h3>
+      <div class="stat-grid">
+        <div class="stat"><span class="v" id="m-tasks">0</span><span class="k">完成任务</span></div>
+        <div class="stat"><span class="v" id="m-waiting">0</span><span class="k">等待车辆</span></div>
+        <div class="stat"><span class="v" id="m-stalled">0</span><span class="k">受阻车辆</span></div>
+        <div class="stat"><span class="v" id="m-collision">0</span><span class="k">碰撞</span></div>
+        <div class="stat"><span class="v" id="m-charging">0</span><span class="k">充电中</span></div>
+        <div class="stat"><span class="v" id="m-chargeq">0</span><span class="k">充电排队</span></div>
+        <div class="stat"><span class="v" id="m-battery">100</span><span class="k">平均电量%</span></div>
+        <div class="stat"><span class="v" id="m-conn">—</span><span class="k">连接状态</span></div>
+      </div>
+      <div id="per-vehicle" class="small">各车完成数：—</div>
     </div>
-  </header>
 
-  <main>
-    <div id="map-wrap">
-      <canvas id="cv-static"></canvas>
-      <canvas id="cv-obstacle"></canvas>
-      <canvas id="cv-dynamic"></canvas>
-      <div id="loading">正在连接仿真服务…</div>
-      <div id="toast" class="hidden"></div>
+    <div class="panel hidden" id="vehicle-panel">
+      <h3>车辆详情 <button id="btn-close-vehicle" class="mini">×</button></h3>
+      <div id="vehicle-info" class="small"></div>
     </div>
 
-    <aside>
-      <section>
-        <h2>运行指标</h2>
-        <div class="metrics-grid">
-          <div class="metric"><span id="m-done">0</span><label>完成任务</label></div>
-          <div class="metric"><span id="m-in">0</span><label>入库</label></div>
-          <div class="metric"><span id="m-out">0</span><label>出库</label></div>
-          <div class="metric"><span id="m-queue">0</span><label>队列任务</label></div>
-          <div class="metric"><span id="m-wait">0</span><label>等待车辆</label></div>
-          <div class="metric"><span id="m-stall">0</span><label>受阻车辆</label></div>
-          <div class="metric"><span id="m-collision">0</span><label>碰撞次数</label></div>
-          <div class="metric"><span id="m-totes">0</span><label>在架料箱</label></div>
-        </div>
-        <h3>各车完成数 (min / avg / max)</h3>
-        <canvas id="cv-bars" width="280" height="80"></canvas>
-        <div id="load-stats">–</div>
-      </section>
-
-      <section id="vehicle-panel" class="hidden">
-        <h2>车辆详情 <button id="btn-unwatch" title="取消订阅">✕</button></h2>
-        <div id="vehicle-info">–</div>
-      </section>
-
-      <section>
-        <h2>事件日志</h2>
-        <div id="event-log"><div class="evt muted">等待事件…</div></div>
-      </section>
-
-      <section>
-        <h2>图例 / 操作说明</h2>
-        <div class="legend">
-          <span><i class="lg slot"></i>存储点位</span>
-          <span><i class="lg tote"></i>料箱</span>
-          <span><i class="lg veh"></i>小车</span>
-          <span><i class="lg waiting"></i>等待</span>
-          <span><i class="lg stalled"></i>受阻</span>
-          <span><i class="lg obstacle"></i>障碍物</span>
-          <span><i class="lg wall"></i>围墙</span>
-          <span><i class="lg inbound"></i>入库口</span>
-          <span><i class="lg outbound"></i>出库口</span>
-        </div>
-        <p class="hint">
-          点击小车查看详情；点击空格添加障碍物，点击障碍物删除；<br/>
-          小车可从静置料箱底部穿行，携带料箱时格子被占用。
-        </p>
-      </section>
-    </aside>
-  </main>
-
-  <script src="app.js"></script>
+    <div class="panel" id="events-panel">
+      <h3>事件</h3>
+      <div id="event-feed" class="small"></div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="app.js"></script>
 </body>
 </html>

@@ -14,11 +14,13 @@ URL: `ws://<host>:<port>/ws`
 ### `delta` （高频，约每 tick 一条）
 ```json
 { "type": "delta", "tick": 12346,
-  "vehicles": [ { "id": 7, "from": [12,34], "to": [12,35], "state": "to_dropoff" } ],
+  "vehicles": [ { "id": 7, "from": [12,34], "to": [12,35], "state": "to_dropoff", "battery": 836 } ],
   "totes":   [ { "id": 3, "at": [12,35], "state": "carried", "carried_by": 7 } ],
-  "metrics": { "tasks_done": 341, "waiting": 5, "stalled": 0, "collision": 0 } }
+  "metrics": { "tasks_done": 341, "waiting": 5, "stalled": 0, "collision": 0,
+               "charging": 8, "charge_queue": 2, "avg_battery": 71 } }
 ```
 - `vehicles[].from/to` 为逻辑格；客户端做插值渲染。
+- `vehicles[].battery` 仅在变化时携带；`state` 枚举同 `GET /api/state`（含 `to_charge`/`charging`）。
 - 数组为增量：仅包含本 tick 发生变化的实体；空数组表示无变化。
 - `metrics` 每条 delta 都全量携带（字段少，免去客户端合并逻辑）。
 
@@ -38,7 +40,7 @@ URL: `ws://<host>:<port>/ws`
 { "type": "event", "tick": 12400, "kind": "stall_recovered",
   "vehicle_id": 42, "detail": "rerouted after obstacle" }
 ```
-`kind` ∈ `stall_detected` | `stall_recovered` | `task_blocked` | `task_unblocked`。
+`kind` ∈ `stall_detected` | `stall_recovered` | `task_blocked` | `task_unblocked` | `charge_started` | `charge_done` | `charge_queued`。
 
 ## 客户端→服务端消息
 
