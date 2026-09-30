@@ -46,18 +46,17 @@ class Planner:
         self.docked: set[Cell] = set()  # 引擎注入（静置料箱格集合，热路径内联用）
         # FR-024 热点格通行代价加权（与 TURN_PENALTY 正交叠加进 g 函数）
         self.hotspots: dict[Cell, float] = {}
-        # 货架横向通道单向化（隔行交替 E/W）：row ∈ aisle_e 只许东行，aisle_w 只许西行
-        self.aisle_e: set[int] = set()
-        self.aisle_w: set[int] = set()
-        c0, c1 = cfg.SHELF_COL_RANGE
-        if cfg.ONE_WAY_AISLES:
-            r0, r1 = cfg.SHELF_ROW_RANGE
-            for r in range(r0 + 1, r1, 2):  # 通道行（奇数行，点位行为偶数）
-                if (r // 2) % 2 == 0:
-                    self.aisle_e.add(r)
-                else:
-                    self.aisle_w.add(r)
-        self._shelf_col = (c0, c1)
+        # 每 tick 规划节点预算（002 性能修复，FR-016 口径外的工程护栏）：
+        # 深度拥塞下 A* 前沿爆炸会使 tick 成本失控 → 超预算的规划按
+        # "暂时不可达"处理（调用方已有冷却重试逻辑）
+        self.node_budget = cfg.PLANNER_NODE_BUDGET
+        self._nodes_used = 0
+        # （001 期全图单向通道 aisle_e/aisle_w 已移除——由 Grid 有向边覆盖层
+        #  统一承担充电区矢量性与布局预设的局部单向段，002 T045）
+
+    def new_tick(self):
+        """每 tick 重置全局规划预算（engine.tick 开头调用）。"""
+        self._nodes_used = 0
 
     def cell_cost(self, cell: Cell) -> float:
         return 1.0 + self.hotspots.get(cell, 0.0)
@@ -80,19 +79,26 @@ class Planner:
         """
         if start == goal:
             return []
+        # 002 性能修复：本 tick 全局节点预算已耗尽 → 立即失败（调用方按
+        # 暂时不可达处理，冷却后重试），避免每次调用仍付出搜索初始化代价
+        if self._nodes_used >= self.node_budget:
+            return None
         blocked = self.grid.blocked
         docked = self.docked
         hotspots = self.hotspots
         turn_penalty = cfg.TURN_PENALTY
-        aisle_e, aisle_w = self.aisle_e, self.aisle_w
-        sc0, sc1 = self._shelf_col
+        pile_cells = self.grid.pile_cells
+        can_traverse = self.grid.can_traverse
+        vector_cells = self.grid.vector_cells  # 矢量规则格总集（热路径快速过滤）
         if goal in blocked or (carrying and goal in docked):
             return None
 
         start_dir = facing if facing in DIRS else "E"
         gr, gc = goal
-        # 加权曼哈顿启发式（WH 可 > 0，加权 A* 标准做法；热点/转弯代价均 ≥0）
-        wh = 1.6
+        # 加权曼哈顿启发式（加权 A* 标准做法；热点/转弯代价均 ≥0）。
+        # WH 越大越贪心：高拥塞下防 A* 前沿近全图爆炸（002 性能修复，
+        # 实测 WH=3.0 与 1.6 吞吐差 ~3.4%，CPU 相差 50 倍），可配置
+        wh = cfg.PLANNER_WH
         h = lambda r, c: wh * (abs(r - gr) + abs(c - gc))
         tie = 0
         open_heap = [(h(*start), 0, 0, (start[0], start[1], start_dir))]
@@ -116,8 +122,11 @@ class Planner:
                 path.reverse()
                 return path
             nodes += 1
+            self._nodes_used += 1
             if nodes > max_nodes:
                 return None
+            if self._nodes_used > self.node_budget:
+                return None  # 全局预算耗尽：本 tick 不再做大搜索（冷却重试）
             di = DIR_LIST.index(d)
             for turn, nd_i in ((0, di), (1, (di + 1) % 4), (-1, (di + 3) % 4),
                                (2, (di + 2) % 4)):
@@ -127,10 +136,15 @@ class Planner:
                 ncell = (nr, nc)
                 if ncell in blocked or (carrying and ncell in docked):
                     continue
-                # 货架横向通道单向流：逆行即跳过（消除对向互堵，SC-002）
-                if nr in aisle_e and nd == "W" and sc0 <= nc <= sc1:
-                    continue
-                if nr in aisle_w and nd == "E" and sc0 <= nc <= sc1:
+                # 充电桩矢量性（002 FR-008，与引擎仲裁同源）：
+                # 桩格仅可作目标且只能自南向北进入；矢量规则格经白名单校验。
+                # 性能：绝大多数格子无矢量规则（非 vector_cells），直接放行，
+                # 避免 2.4 亿次/千 tick 级的 can_traverse 函数调用（profile 定位）
+                if ncell in pile_cells:
+                    if ncell != goal or (r, c) != (nr + 1, nc):
+                        continue
+                elif ((r, c) in vector_cells or ncell in vector_cells) \
+                        and not can_traverse((r, c), ncell):
                     continue
                 if ncell in occupied and ncell != goal:
                     continue

@@ -25,9 +25,10 @@ INBOUND_POOL_SIZE = 30  # 初始置于入库口的循环料箱数（1:1 成对�
 
 
 class Engine:
-    def __init__(self, seed: int | None = None, conflict_log_dir: str | None = None):
+    def __init__(self, seed: int | None = None, conflict_log_dir: str | None = None,
+                 layout: dict | None = None):
         self.rng = random.Random(seed)
-        self.grid = Grid()
+        self.grid = Grid(layout)  # layout=None → config 常量（baseline 缺省）
         self.planner = Planner(self.grid, self._tote_at)
         self.reservations = ReservationTable()
         self.dispatcher = Dispatcher(self.grid, self.rng)
@@ -36,6 +37,10 @@ class Engine:
         self.tick_n = 0
         self.paused = False
         self.collision_count = 0
+        # 拥塞治理开关（FR-015，默认取 config，可运行时独立关闭以便对比）
+        self.govern_backpressure = cfg.GOVERN_BACKPRESSURE
+        self.govern_reassign = cfg.GOVERN_REASSIGN
+        self.govern_charge_defer = cfg.GOVERN_CHARGE_DEFER
 
         self.vehicles: dict[int, Vehicle] = {}
         self.totes: dict[int, Tote] = {}
@@ -53,10 +58,19 @@ class Engine:
         self._prev_batt: dict[int, int] = {}
         self._recover_cooldown: dict[int, int] = {}
         self._plan_fail_tick: dict[int, int] = {}
+        self._charge_try_tick: dict[int, int] = {}  # 充电尝试冷却（30 tick）
+        self._charge_retry_tick: dict[int, int] = {}
         self._park_try_tick: dict[int, int] = {}
         self._parked_ok: set[Cell] = set()  # 已靠边停好的车所在格
         self._delta: dict = {"tick": 0, "vehicles": [], "totes": [], "metrics": {}}
         self._pending_events: list[dict] = []
+        self._state_hist: dict[int, deque] = {}  # vid -> [(tick, state)] 最近 8 条
+        # ---- 002 期：指标快照滑动窗口（FR-016/023，research.md D9）----
+        self.metrics_history: deque = deque(maxlen=600)   # ≤600 点 = 1 小时 @10tick/s
+        self._done_cum_log: deque = deque()               # (tick, 累计完成数)
+        self._done_base_cum = 0                           # 已修剪部分窗口基线
+        self._cycle_log: deque = deque()                  # (done_tick, 周期)
+        self._conflict_end_log: deque = deque()           # 冲突事件 end_tick
 
         self._init_world()
         self._open_conflict_log(conflict_log_dir)
@@ -84,10 +98,14 @@ class Engine:
                  if k == CellKind.FLOOR and c not in self.grid.obstacles
                  and not self.grid.in_charging_area(c)]
         self.rng.shuffle(valid)
+        # 002 修正（快验证发现）：初始电量 50%–100% 错相分布——全队满电出发时
+        # drain 速率相近，会在低电阈值处形成同步充电波（tick ~2200 起数十台同时
+        # 排队，队尾车在等待中耗尽电量）。错相后充电需求在时间上摊开（SC-006）
         for i in range(cfg.VEHICLES):
             cell = valid[i % len(valid)]
+            battery = cfg.BATTERY_FULL * self.rng.uniform(0.5, 1.0)
             v = Vehicle(id=i + 1, cell=cell, render_from=cell,
-                        battery=cfg.BATTERY_FULL)
+                        battery=battery)
             v.facing = self.rng.choice(["N", "E", "S", "W"])
             self.vehicles[v.id] = v
             self.occupant[cell] = v.id
@@ -116,25 +134,81 @@ class Engine:
 
     def tick(self):
         self.tick_n += 1
+        self.planner.new_tick()  # 重置每 tick 规划节点预算（002 性能护栏）
         self._wait_graph.clear()
         changed_v: set[int] = set()
         changed_t: set[int] = set()
         events: list[dict] = []
 
+        # 拥塞背压（FR-005）：按上一 tick 等待率调节任务生成节奏
+        if self.govern_backpressure:
+            waiting_now = sum(1 for v in self.vehicles.values()
+                              if v.state in (VehicleState.WAITING,
+                                             VehicleState.STALLED))
+            active_now = sum(1 for t in self.dispatcher.tasks.values()
+                             if t.state in (TaskState.ASSIGNED,
+                                            TaskState.IN_PROGRESS))
+            self.dispatcher.update_backpressure(
+                waiting_now / max(1, len(self.vehicles)), active_now,
+                cfg.MAX_ACTIVE_TASKS)
         self.dispatcher.maybe_generate(self.tick_n, self.totes, self.inbound_pool)
+        # 002 FR-027 监控发现：充电出队调度原先排在任务规划/重规划之后——全局
+        # 节点预算已被大预算消费者（任务规划 60k×3、重规划 50k×8）吃穿，充电
+        # 行程规划永远拿不到预算 → 空闲桩无人充电、滞零饿死（tick_cost 异常的
+        # 深层根因）。提前到 tick 最前：预算新鲜时优先服务充电调度
+        self._charge_queue_scheduling(changed_v, events)
         self._assign_tasks(changed_v, events)
         self._plan_paths(changed_v)
         self._move_vehicles(changed_v, changed_t, events)
         self._handle_arrivals(changed_v, changed_t, events)
         self._charge_progress(changed_v, changed_t, events)
-        self._charge_queue_scheduling(changed_v, events)
         self._cycling_advance(changed_t)
         self._need_charge_flags(changed_v, events)
         self._deadlock_detection(changed_v, events)
+        self._reassign_stalled_tasks(changed_v, events)
         self._conflict_detection()
         self._finalize_conflicts()
         self._decay_hotspots()
+        self._sample_metrics()
         self._build_delta(changed_v, changed_t, events)
+
+    # ---- 指标快照（002 FR-016/023，research.md D9）----
+
+    def _sample_metrics(self):
+        """每 10 tick 采样滑动窗口指标入环形缓冲（600 点 = 1 小时 @10tick/s）。"""
+        if self.tick_n % 10 != 0:
+            return
+        w = cfg.METRICS_WINDOW_TICKS
+        t0 = self.tick_n - w
+        # 窗口吞吐：累计完成数 - 窗口起点累计数
+        base = self._done_base_cum
+        for tick0, cum0 in self._done_cum_log:
+            if tick0 < t0:
+                base = cum0
+            else:
+                break
+        throughput = self.metrics_tasks_done - base
+        # 窗口内完成任务的平均周期
+        cycles = [c for tk, c in self._cycle_log if tk >= t0]
+        # 窗口内互堵事件频次（次/千 tick，001 口径事件）
+        n_conf = sum(1 for tk in self._conflict_end_log if tk >= t0)
+        waiting = sum(1 for v in self.vehicles.values()
+                      if v.state in (VehicleState.WAITING, VehicleState.STALLED))
+        self.metrics_history.append({
+            "tick": self.tick_n,
+            "throughput_window": throughput,
+            "avg_cycle_ticks": round(sum(cycles) / len(cycles), 1) if cycles else 0,
+            "waiting_ratio": round(waiting / max(1, len(self.vehicles)), 3),
+            "charge_queue_depth": self._charge_queue_depth(),
+            "conflict_per_ktick": round(n_conf * 1000.0 / w, 3),
+        })
+        # 日志修剪（窗口外条目定期清理）
+        while self._done_cum_log and self._done_cum_log[0][0] < t0 - w:
+            self._done_base_cum = self._done_cum_log.popleft()[1]
+        while self._cycle_log and self._cycle_log[0][0] < t0 - w:
+            self._cycle_log.popleft()
+        while self._conflict_end_log and self._conflict_end_log[0] < t0 - w:
+            self._conflict_end_log.popleft()
 
     # ---- 增量组装（契约 websocket.md）----
 
@@ -151,6 +225,13 @@ class Engine:
             if b != self._prev_batt.get(v.id):
                 d["battery"] = b
                 self._prev_batt[v.id] = b
+            # 目标点（FR-021：目标连线绘制端点；无目标显式置空供前端清除）
+            goal = self._current_goal(v)
+            d["goal"] = list(goal) if goal is not None else None
+            # 状态历史（FR-022：最近状态变化时间）
+            h = self._state_hist.setdefault(v.id, deque(maxlen=8))
+            if not h or h[-1][1] != v.state.value:
+                h.append((self.tick_n, v.state.value))
             vs.append(d)
         ts = [{"id": tid, **self._tote_loc(self.totes[tid]),
                "state": self.totes[tid].state.value}
@@ -163,6 +244,9 @@ class Engine:
         for kind, vid in self.charging.drain_events():
             self._pending_events.append({"type": "event", "tick": self.tick_n,
                                          "kind": kind, "vehicle_id": vid})
+        for ev in self.dispatcher.drain_governance_events():
+            self._pending_events.append({"type": "event", "tick": self.tick_n,
+                                         **ev})
 
     def last_delta(self) -> dict:
         return self._delta
@@ -174,6 +258,20 @@ class Engine:
 
     # ---- 派单（FR-004 / R4）----
 
+    def _station_load(self, side: str) -> int:
+        """工作站同时在场车辆数（FR-004）：在站车辆 + 已派任务指向该站的车。"""
+        cells = set(self.grid.inbound_cells if side == "inbound"
+                    else self.grid.outbound_cells)
+        occ = sum(1 for v in self.vehicles.values() if v.cell in cells)
+        targeting = 0
+        for t in self.dispatcher.tasks.values():
+            if t.assigned_vehicle is None or t.state != TaskState.ASSIGNED:
+                continue
+            tgt = t.pickup if side == "inbound" else t.dropoff
+            if tgt in cells:
+                targeting += 1
+        return occ + targeting
+
     def _assign_tasks(self, changed_v: set[int], events: list[dict]):
         # WIP 限流（规格假设：基准负载约 80 台在途、20 台空闲待命）：
         # 在途任务达上限时停止派发，防止全队投入引发拥塞死亡螺旋
@@ -181,6 +279,10 @@ class Engine:
                      if t.state in (TaskState.ASSIGNED, TaskState.IN_PROGRESS))
         if active >= cfg.MAX_ACTIVE_TASKS:
             return
+        # 002 性能修复：站点负载每 tick 缓存一次（此前每个候选任务重算一次，
+        # 每调用全队+全任务扫描，3000 tick 内被调 18.6 万次、占 1/3 引擎耗时）
+        station_load = {side: self._station_load(side)
+                        for side in ("inbound", "outbound")}
         attempts = 0
         for v in self.dispatcher.assignable_vehicles(self.vehicles):
             if attempts >= 3:  # 每 tick 限流尝试，避免不可达任务拖垮派单
@@ -188,9 +290,14 @@ class Engine:
             task = self.dispatcher.peek_task()
             if task is None:
                 break
+            # 工作站容量（002 FR-004）：指向饱和站点的任务暂缓派发（留队列）
+            if station_load["inbound" if task.type == "inbound" else "outbound"] \
+                    >= cfg.STATION_CAPACITY:
+                self.dispatcher.rotate_task(task)
+                continue
             attempts += 1
             path = self.planner.plan(v.cell, task.pickup, v.facing, False,
-                                     self.occupied_by_others(v.id), max_nodes=60_000)
+                                     self.occupied_by_others(v.id), max_nodes=20_000)
             if path is None:
                 if task.state != TaskState.BLOCKED:
                     task.state = TaskState.BLOCKED
@@ -199,7 +306,11 @@ class Engine:
                 continue
             self.dispatcher.take_task(task)
             task.assigned_vehicle = v.id
+            task.assigned_tick = self.tick_n
+            task.last_progress_tick = self.tick_n
+            station_load["inbound" if task.type == "inbound" else "outbound"] += 1
             v.assigned_count += 1
+            v.defer_charge = False  # 任务召回优先于错峰充电（FR-009）
             self._parked_ok.discard(v.cell)
             v.task = task
             v.path = path
@@ -228,7 +339,7 @@ class Engine:
                 continue
             carrying = v.carrying is not None
             path = self.planner.plan(v.cell, goal, v.facing, carrying,
-                                     self.occupied_by_others(v.id), max_nodes=50_000)
+                                     self.occupied_by_others(v.id), max_nodes=15_000)
             if path is not None:
                 v.path = path
                 self._plan_fail_tick.pop(v.id, None)
@@ -257,21 +368,39 @@ class Engine:
     def _move_vehicles(self, changed_v: set[int], changed_t: set[int],
                        events: list[dict]):
         self.reservations.clear()
-        # 公平仲裁：等待最久者优先预约（防饿死）；WAITING 车每 tick 重试
+        # 公平仲裁：等待最久者优先预约（防饿死）；WAITING 车每 tick 重试。
+        # STALLED 车保留移动能力（002 修正）：受阻=检测标记而非移动冻结——
+        # 路径下一格空闲时照常走（仲裁仍生效），否则"前车受阻滞留、后车堵死"
+        # 且恢复阶梯无法解围（路径相同被拒/阻挡车在充电/改派churn）的死锁形态
         movers = [v for v in self.vehicles.values()
                   if v.path and v.state not in (VehicleState.IDLE,
-                                                VehicleState.CHARGING,
-                                                VehicleState.STALLED)]
+                                                VehicleState.CHARGING)]
         movers.sort(key=lambda v: (-v.stall_ticks, v.id))
+        eligible: set[int] = set()  # 本 tick 获得位移配额的车（停滞计数仅对其生效）
         for v in movers:
             nxt = v.path[0]
+            # ---- 位移配额（002 FR-006：进度累加速度模型，research.md D1）----
+            dr0, dc0 = nxt[0] - v.cell[0], nxt[1] - v.cell[1]
+            move_dir = {(0, 1): "E", (0, -1): "W", (1, 0): "S", (-1, 0): "N"}.get(
+                (dr0, dc0))
+            turning = move_dir is not None and move_dir != v.facing
+            if v.progress < 1.0:
+                v.progress += self._vehicle_speed(v, turning)
+                if v.progress < 1.0:
+                    continue  # 未获配额：非等待/停滞（载货/转弯的合法慢速）
+            eligible.add(v.id)
             # 障碍物/围墙校验（FR-011：绝不驶入障碍格）
             if not self.planner.can_enter(nxt, v.carrying is not None):
                 v.path = []  # 触发重规划
                 continue
+            # 充电桩矢量性（002 FR-008：与规划同源校验，杜绝"规划能过、执行被拒"）
+            if not self.grid.can_traverse(v.cell, nxt,
+                                          to_is_goal=(nxt == v.charge_target)):
+                v.path = []  # 触发重规划
+                continue
             other = self.occupant.get(nxt)
             if other is not None and other != v.id:
-                if v.state != VehicleState.WAITING:
+                if v.state != VehicleState.WAITING and v.prev_state is None:
                     v.prev_state = v.state
                 v.state = VehicleState.WAITING
                 v.wait_reason = other
@@ -279,38 +408,66 @@ class Engine:
                 continue
             if not self.reservations.try_reserve(nxt, v.id):
                 owner = self.reservations.owner(nxt)
-                if v.state != VehicleState.WAITING:
+                if v.state != VehicleState.WAITING and v.prev_state is None:
                     v.prev_state = v.state
                 v.state = VehicleState.WAITING
                 v.wait_reason = owner
                 if owner:
                     self._wait_graph[v.id] = owner
                 continue
-            # 执行移动（一 tick 一格）
+            # 执行移动（一 tick 至多一格；配额 ≥1 方可位移）
             del self.occupant[v.cell]
             v.render_from = v.cell
             v.cell = nxt
             v.path.pop(0)
+            v.progress = max(0.0, v.progress - 1.0)
             self.occupant[nxt] = v.id
+            v.last_move_tick = self.tick_n
             dr, dc = nxt[0] - v.render_from[0], nxt[1] - v.render_from[1]
             v.facing = {(0, 1): "E", (0, -1): "W", (1, 0): "S", (-1, 0): "N"}.get(
                 (dr, dc), v.facing)
-            # 电量消耗（FR-025：空载 1 点/格，载货 1.5 点/格）
-            v.battery = max(0.0, v.battery - (cfg.LOAD_FACTOR if v.carrying else 1.0))
+            # 电量消耗（002 FR-007：载重倍率 × 转向附加，非负截断）
+            self._apply_move_energy(v, turning)
             v.stall_ticks = 0
             v.moved_this_tick = True
             if v.state == VehicleState.WAITING:
                 v.state = v.prev_state or VehicleState.TO_PICKUP
                 v.prev_state = None
                 v.wait_reason = None
+            elif v.state == VehicleState.STALLED:
+                # 受阻车恢复移动：回 stall 前状态（002：STALLED 不再冻结移动）
+                v.state = v.prev_state or VehicleState.TO_PICKUP
+                v.prev_state = None
             changed_v.add(v.id)
+            if v.task is not None:
+                v.task.last_progress_tick = self.tick_n  # 无进度改派口径（FR-002）
             if v.carrying is not None:
                 changed_t.add(v.carrying.id)
-        # 未移动的 mover 恢复计时
+        # 未移动的 mover 恢复计时（仅对获得位移配额仍被阻者计停滞）
         for v in movers:
-            if not v.moved_this_tick:
+            if v.id in eligible and not v.moved_this_tick:
                 v.stall_ticks += 1
             v.moved_this_tick = False
+
+    # ---- 硬件模型（002 FR-006/007，research.md D1/D2）----
+
+    @staticmethod
+    def _vehicle_speed(v: Vehicle, turning: bool) -> float:
+        """状态唯一决定速度：1.0 空载直行；×载货比率；×转向比率。"""
+        speed = 1.0
+        if v.carrying is not None:
+            speed *= cfg.LOADED_SPEED_RATIO
+        if turning:
+            speed *= cfg.TURN_SPEED_RATIO
+        return speed
+
+    @staticmethod
+    def _apply_move_energy(v: Vehicle, turning: bool):
+        """每格电量扣减：基础 1.0 × 载重倍率，转向步叠加附加能耗；非负截断。"""
+        drain = 1.0 * (cfg.LOAD_FACTOR if v.carrying is not None else 1.0)
+        if turning:
+            drain += cfg.TURN_ENERGY
+        v.battery = max(0.0, v.battery - drain)
 
     # ---- 到达处理 ----
 
@@ -386,43 +543,94 @@ class Engine:
             changed_t.add(tote.id)
             v.carrying = None
         task.state = TaskState.DONE
+        self.dispatcher.mark_done(task, self.tick_n)
+        self._done_cum_log.append((self.tick_n, self.metrics_tasks_done))
+        self._cycle_log.append((self.tick_n,
+                                self.tick_n - task.created_tick))
         v.task = None
         v.completed_count += 1
         self.metrics_tasks_done += 1
         v.state = VehicleState.IDLE
         changed_v.add(v.id)
         self.dispatcher.release_claims(task)
-        # FR-025：完成任务瞬间若需充电 → 派发充电行程（优先于新任务）
+        # FR-025：完成任务瞬间若需充电 → 派发充电行程（优先于新任务，含错峰判定）
         if v.need_charge and v.battery < cfg.battery_low():
-            self._start_charge_trip(v, changed_v, events)
+            self._maybe_start_charge(v, changed_v, events)
 
-    # ---- 充电（FR-025/026，R10）----
+    # ---- 充电（FR-025/026，R10；002 FR-008/009 增量）----
+
+    def _charge_queue_depth(self) -> int:
+        """充电排队深度 = 排队车辆 + 在充车辆（错峰判定口径，FR-009）。"""
+        return (len(self.grid.charging.queue)
+                + sum(1 for o in self.vehicles.values()
+                      if o.state == VehicleState.CHARGING))
+
+    def _maybe_start_charge(self, v: Vehicle, changed_v: set[int],
+                            events: list[dict]):
+        """错峰充电判定（FR-009 / research.md D7）：排队深度超软上限时，非紧急
+        低电车延迟充电（保持待命、可被任务召回）；紧急车（≤临界）始终优先。"""
+        depth = self._charge_queue_depth()
+        # defer 兜底（002 快验证修正）：电量已逼近临界（≤2×临界值）的车不再错峰——
+        # 继续排队等待的代价（排队期间持续耗电）已高于拥塞贡献，拖到归零即违反 SC-006
+        defer_floor = cfg.battery_critical() * 2
+        if (self.govern_charge_defer and depth >= cfg.CHARGE_QUEUE_SOFT_LIMIT
+                and v.battery > defer_floor):
+            if not v.defer_charge:
+                v.defer_charge = True
+                events.append({"kind": "governance_event",
+                               "action": "charge_deferred",
+                               "vehicles": [v.id],
+                               "detail": f"queue depth {depth} >= "
+                                         f"{cfg.CHARGE_QUEUE_SOFT_LIMIT}, deferred"})
+            return
+        v.defer_charge = False
+        self._start_charge_trip(v, changed_v, events)
 
     def _start_charge_trip(self, v: Vehicle, changed_v: set[int],
                            events: list[dict]):
-        pile = self.charging.free_pile()
-        if (pile is not None and pile in self.occupant
-                and self.occupant[pile] != v.id):
-            pile = None  # 充电位被滞留车物理占据：按无空桩处理（进排队）
-        if pile is None:
-            # 桩满 → 排队格等待（电量更低者优先出队）
-            target = self.charging.assign_queue_cell(
-                v, set(self.occupant) - {v.cell})
-            if target is None:
-                return  # 排队格也满：留在原地稍后再试
+        self._release_pile_claim(v)  # 防御：重试前释放陈旧认领（防一车双桩）
+        v.charge_target = None
+        # 002 性能修复（快验证 profile 实测）：就近试至多 2 个空闲桩；全部规划
+        # 失败 → 回退排队分支。此前失败即返回不排队——约 100 台低电车每冷却窗
+        # 重试同一不可达桩，1500 tick 内 4.1 万次调用、烧 8200 万 A* 节点
+        r0, c0 = v.cell
+        free_piles = sorted(
+            (p for p, o in self.grid.charging.pile_owner.items() if o is None),
+            key=lambda p: abs(p[0] - r0) + abs(p[1] - c0))[:2]
+        planned = False
+        for pile in free_piles:
+            if pile in self.occupant and self.occupant[pile] != v.id:
+                continue  # 充电位被滞留车物理占据
+            path = self.planner.plan_any_dir(v.cell, pile, False,
+                                             self.occupied_by_others(v.id),
+                                             max_nodes=3_000)
+            if path is None:
+                continue  # 暂不可达：换桩/回退排队，冷却后重试
+            self.area_claim_pile(pile, v.id)
             v.state = VehicleState.TO_CHARGE
-            v.charge_target = target
-            self.charging.enqueue(v.id, v.battery)
+            v.charge_target = pile
+            v.path = path
             changed_v.add(v.id)
+            planned = True
+            break
+        if planned:
             return
-        path = self.planner.plan_any_dir(v.cell, pile, False,
-                                         self.occupied_by_others(v.id))
+        # 桩满/不可达 → 排队格等待（电量更低者优先出队）。必须规划到排队格的
+        # 实际路径并成功后才入队——只设 charge_target 不规划路径会让车原地成
+        # to_charge 僵尸、自愈回 idle 后队列条目残留（排队深度失真 → 错峰失效）
+        target = self.charging.assign_queue_cell(
+            v, set(self.occupant) - {v.cell})
+        if target is None:
+            return  # 排队格也满：留在原地稍后再试
+        path = self.planner.plan_any_dir(v.cell, target, False,
+                                         self.occupied_by_others(v.id),
+                                         max_nodes=3_000)
         if path is None:
-            return  # 暂不可达：下 tick 重试（pile 未被认领）
-        self.area_claim_pile(pile, v.id)
+            return  # 暂不可达：不入队（防僵尸条目），冷却后重试
         v.state = VehicleState.TO_CHARGE
-        v.charge_target = pile
+        v.charge_target = target
         v.path = path
+        self.charging.enqueue(v.id, v.battery)
         changed_v.add(v.id)
 
     def area_claim_pile(self, pile: Cell, vid: int):
@@ -437,6 +645,16 @@ class Engine:
     def _arrive_charge(self, v: Vehicle, changed_v: set[int]):
         pile = self.charging.at_pile(v)
         if pile is not None and v.cell == pile:
+            # 供电功率预算（002 FR-008）：在充总功率不得超预算（比例 <1 时生效）
+            charging_now = sum(1 for o in self.vehicles.values()
+                               if o.state == VehicleState.CHARGING)
+            rate = cfg.charge_rate_per_tick()
+            budget = (cfg.CHARGE_PILES * rate * cfg.CHARGE_POWER_BUDGET_RATIO)
+            if (charging_now + 1) * rate > budget:
+                v.state = VehicleState.WAITING  # 桩前等待功率额度
+                v.prev_state = VehicleState.TO_CHARGE
+                changed_v.add(v.id)
+                return
             v.state = VehicleState.CHARGING
             changed_v.add(v.id)
             return
@@ -466,7 +684,13 @@ class Engine:
                 changed_v.add(v.id)
 
     def _charge_queue_scheduling(self, changed_v: set[int], events: list[dict]):
-        while True:
+        # 002 FR-027 监控发现（tick ~4300 现场解剖：9 个空闲桩 0 台在充、20 台
+        # 滞零饿死）：原实现队首出队失败即 break——队首恰是最缺电（滞零、离桩
+        # 远、规划必败）的车，10-tick 冷却内整条队列停摆，空闲桩无人充电。
+        # 修复：失败者移队尾并继续试下一个候选（电量更低者优先出队不变，
+        # 但失败不再阻塞队伍）；每 tick 至多 3 次出队尝试限规划成本
+        attempts = 0
+        while attempts < 3:
             got = self.charging.dequeue_for_pile(
                 {v.id: v.battery for v in self.vehicles.values()})
             if got is None:
@@ -474,24 +698,67 @@ class Engine:
             vid, pile = got
             v = self.vehicles.get(vid)
             if v is None or not v.need_charge or v.state == VehicleState.CHARGING:
-                continue
+                continue  # 失效条目：丢弃，不占尝试配额
             # 充电位仍被滞留车物理占据（充满未驶离）→ 暂缓分配，防其堵在桩旁
             if pile in self.occupant and self.occupant[pile] != vid:
                 self.charging.area.queue.insert(0, vid)
                 break
+            attempts += 1
+            # 规划冷却（002 性能修复）：失败车 10 tick 内不反复规划（拥塞下
+            # 不可达充电行程的 A* 代价极高）——移队尾，不阻塞后续候选
+            if self.tick_n - self._charge_retry_tick.get(vid, -10**9) < 10:
+                self.charging.area.queue.append(vid)
+                continue
             # 先释放该车此前认领的充电位（防重复认领）
             self._release_pile_claim(v)
             path = self.planner.plan_any_dir(v.cell, pile, False,
-                                             self.occupied_by_others(v.id))
+                                             self.occupied_by_others(v.id),
+                                             max_nodes=20_000)
             if path is None:
-                self.charging.area.queue.insert(0, vid)  # 暂不可达：回队
-                break
+                self.charging.area.queue.append(vid)  # 暂不可达：移队尾
+                self._charge_retry_tick[vid] = self.tick_n
+                continue
             self.area_claim_pile(pile, vid)
             v.charge_target = pile
             v.state = VehicleState.TO_CHARGE
             v.prev_state = None
             v.path = path
             changed_v.add(v.id)
+        # ---- 空闲车直发（002 FR-027 补充）：队列服务完仍有空闲桩时，按电量
+        # 升序为未入队的 need_charge 闲车直接规划去桩行程——此前该路径走
+        # _need_charge_flags（tick 末段），预算已被任务规划吃穿，其充电尝试
+        # 永远拿不到规划资源（车辆 72 滞零 2400+ tick 的根因）
+        while attempts < 3:
+            free = [p for p, o in self.grid.charging.pile_owner.items()
+                    if o is None and p not in self.occupant]
+            if not free:
+                break
+            cands = [o for o in self.vehicles.values()
+                     if o.need_charge and o.state is VehicleState.IDLE
+                     and o.charge_target is None
+                     and o.id not in self.grid.charging.queue
+                     and (not o.defer_charge
+                          or o.battery <= cfg.battery_critical())]
+            if not cands:
+                break
+            c = min(cands, key=lambda o: o.battery)
+            cr, cc = c.cell
+            pile = min(free, key=lambda p: abs(p[0] - cr) + abs(p[1] - cc))
+            path = self.planner.plan_any_dir(c.cell, pile, False,
+                                             self.occupied_by_others(c.id),
+                                             max_nodes=10_000)
+            if path is None:
+                self._plan_fail_tick[c.id] = self.tick_n
+                self._charge_try_tick[c.id] = self.tick_n
+                break  # 就近桩不可达：本 tick 不再直发（冷却后重试）
+            self.area_claim_pile(pile, c.id)
+            c.charge_target = pile
+            c.state = VehicleState.TO_CHARGE
+            c.prev_state = None
+            c.path = path
+            c.defer_charge = False
+            changed_v.add(c.id)
+            attempts += 1
 
     # ---- 料箱循环（FR-018）----
 
@@ -517,13 +784,22 @@ class Engine:
             low = v.battery < cfg.battery_low()
             if low and not v.need_charge:
                 v.need_charge = True
-                # 空闲车立即出发；执行任务的车等任务完成（_dropoff 触发）
-                if v.state == VehicleState.IDLE:
-                    self._start_charge_trip(v, changed_v, events)
+                # 出发由下方统一逻辑处理（空闲车每 tick 尝试，含错峰判定）
             # 兜底（FR-026/SC-010）：电量临界仍未充电 → 放弃当前等待，直接去充电
-            # 载货车：就地落箱（任务起点更新后重派），保证任何车辆不电量归零
+            # 载货车：就地落箱（任务起点更新后重派），保证任何车辆不电量归零。
+            # 002 性能修复：同样受 5-tick 规划冷却约束——否则深拥塞下每台临界车
+            # 每 tick 烧一次 A*（≤2 万节点/次），tick 成本无界。
+            # 002 FR-027 监控发现（tick ~6000 规划风暴实测 3087 次/600 tick）：
+            # 电量归零的车恒满足"临界"，兜底每 5 tick 把已在充电排队的车拽出
+            # 队列、重规划入队、再拽出——无限循环烧穿节点预算。已在充电流程中
+            # （排队中 / 已有充电目标）的车一律交给充电调度，兜底让位
+            in_charge_flow = (v.id in self.grid.charging.queue
+                              or v.charge_target is not None)
             if (v.battery < cfg.battery_critical()
-                    and v.state not in (VehicleState.CHARGING, VehicleState.TO_CHARGE)):
+                    and v.state not in (VehicleState.CHARGING, VehicleState.TO_CHARGE)
+                    and not in_charge_flow
+                    and self.tick_n - self._plan_fail_tick.get(v.id, -10**9) >= 5
+                    and self.tick_n - self._charge_try_tick.get(v.id, -10**9) >= 30):
                 if v.carrying is not None:
                     if self._drop_tote_here(v) and v.task is not None:
                         v.task.pickup = v.cell
@@ -537,17 +813,42 @@ class Engine:
                     v.task.assigned_vehicle = None
                     v.task = None
                 self._release_pile_claim(v)
-                if v.id in self.grid.charging.queue:
-                    self.grid.charging.queue.remove(v.id)
                 v.state = VehicleState.IDLE
                 v.prev_state = None
                 v.way_target = None
                 v.stall_ticks = 0
+                v.defer_charge = False  # 紧急车不受错峰约束（FR-009）
                 self._start_charge_trip(v, changed_v, events)
+                # 无论成败：30 tick 内兜底不再重试（成败均由各自调度驱动）
+                self._plan_fail_tick[v.id] = self.tick_n
+                self._charge_try_tick[v.id] = self.tick_n
                 changed_v.add(v.id)
+            # ---- 002 FR-009 错峰充电（research.md D7）----
+            # defer 车重估：排队深度回落或电量进入临界 → 解除延迟（紧急车始终优先）
+            if v.defer_charge and v.state == VehicleState.IDLE:
+                if (v.battery <= cfg.battery_critical()
+                        or self._charge_queue_depth() < cfg.CHARGE_QUEUE_SOFT_LIMIT):
+                    v.defer_charge = False
+                    changed_v.add(v.id)
+            # 空闲需充电车每 5 tick 尝试出发（defer 中除外；修复 001 期
+            # "排队格满后永不重试"的松散点；冷却防规划风暴）。
+            # 002 性能修复：充电尝试独立冷却（30 tick）——拥塞下可达性分钟级才
+            # 变化，高频重试只是重复烧节点（FR-027 监控在 tick 15000 二次充电波
+            # 捕获 105s/窗的规划风暴；同窗口实测 84 次 plan 调用/tick）
+            if (v.state == VehicleState.IDLE and v.need_charge
+                    and not v.defer_charge and not v.path
+                    and self.tick_n - self._plan_fail_tick.get(v.id, -10**9) >= 5
+                    and self.tick_n - self._charge_try_tick.get(v.id, -10**9) >= 30):
+                before_state = v.state
+                self._maybe_start_charge(v, changed_v, events)
+                if v.state == before_state and not v.path:
+                    self._plan_fail_tick[v.id] = self.tick_n  # 失败：5 tick 冷却
+                    self._charge_try_tick[v.id] = self.tick_n  # 充电尝试：15 tick 冷却
             # 状态清理：无处可等的 WAITING 僵尸（无路径、不在充电排队）→ 回 idle
             if (v.state == VehicleState.WAITING and not v.path
                     and not (v.cell in self.grid.charging.queue_cells and v.need_charge)):
+                self._release_pile_claim(v)  # 002 修复：陈旧桩位认领一并释放
+                v.charge_target = None
                 v.state = VehicleState.IDLE
                 v.prev_state = None
                 changed_v.add(v.id)
@@ -558,6 +859,8 @@ class Engine:
                     and not self.charging.at_pile(v)
                     and v.cell not in self.grid.charging.queue_cells):
                 self._release_pile_claim(v)
+                if v.id in self.grid.charging.queue:
+                    self.grid.charging.queue.remove(v.id)  # 队列条目同步清理
                 v.state = VehicleState.IDLE
                 v.prev_state = None
                 v.charge_target = None
@@ -608,10 +911,12 @@ class Engine:
         if self.tick_n - self._park_try_tick.get(v.id, -10**9) < 30:
             return
         self._park_try_tick[v.id] = self.tick_n
-        for best in self._pick_parking_slots(v):
+        # 002 性能修复：单次至多尝试 3 个选点（此前 20 个逐一规划 × 3 万节点，
+        # 100 台空闲车构成每 tick ~40 次调用的规划风暴，tick 成本失控）
+        for best in self._pick_parking_slots(v)[:3]:
             path = self.planner.plan_any_dir(v.cell, best, False,
                                              self.occupied_by_others(v.id),
-                                             max_nodes=30_000)
+                                             max_nodes=10_000)
             if path:
                 v.state = VehicleState.MAKING_WAY
                 v.way_target = best
@@ -646,7 +951,12 @@ class Engine:
         return sorted(cands, key=score)
 
     def _try_park_aside(self, v: Vehicle, changed_v: set[int]):
-        """空闲车就近挪到存储点位格待命（不占通道/工作站，FR-028 靠边待命）。"""
+        """空闲车就近挪到存储点位格待命（不占通道/工作站，FR-028 靠边待命）。
+
+        注：need_charge 车同样 MUST 靠边（002 FR-027 监控发现：充电待命车滞留
+        通道会把前往充电位的车永久堵死）——其充电行程由调度从任意泊位发起，
+        靠边不影响充电优先级。
+        """
         if self.tick_n - self._park_try_tick.get(v.id, -10**9) < 30:
             return  # 冷却，防反复尝试
         self._park_try_tick[v.id] = self.tick_n
@@ -654,11 +964,12 @@ class Engine:
         k = self.grid.kind.get(v.cell)
         if k in (CellKind.INBOUND, CellKind.OUTBOUND):
             # 工作站放置位：半径搜索必然失败（附近无点位）→ 全局疏散，
-            # 选点用「就近 + 分散」（_pick_parking_slots，澄清 2026-09-30 选项 A）
-            for best in self._pick_parking_slots(v):
+            # 选点用「就近 + 分散」（_pick_parking_slots，澄清 2026-09-30 选项 A）；
+            # 单次至多 3 个选点（同 _exit_charging 的规划风暴修复）
+            for best in self._pick_parking_slots(v)[:3]:
                 path = self.planner.plan(v.cell, best, v.facing, False,
                                          self.occupied_by_others(v.id),
-                                         max_nodes=30_000)
+                                         max_nodes=10_000)
                 if path:
                     v.state = VehicleState.MAKING_WAY
                     v.way_target = best
@@ -716,7 +1027,7 @@ class Engine:
         goal = self._current_goal(v)
         if goal is not None and goal != v.cell:
             path = self.planner.plan(v.cell, goal, v.facing, v.carrying is not None,
-                                     self.occupied_by_others(v.id), max_nodes=40_000)
+                                     self.occupied_by_others(v.id), max_nodes=15_000)
             if path is not None and path != v.path:
                 v.path = path
                 v.state = v.prev_state or VehicleState.TO_PICKUP
@@ -777,6 +1088,43 @@ class Engine:
             events.append({"kind": "stall_recovered", "vehicle_id": v.id,
                            "detail": "trip cancelled"})
 
+    # ---- 停滞改派（002 FR-002，research.md D4）----
+
+    def _reassign_stalled_tasks(self, changed_v: set[int], events: list[dict]):
+        """任务无进度超过 REASSIGN_TICKS 的「未取货」任务自动改派（阈值兜底）。
+
+        口径：task.last_progress_tick 起算执行车持续无移动时长——恢复阶梯
+        （FR-012）负责卡死车辆的常规回收（dispatcher.unassign 亦计改派），
+        本方法兜底"重规划持续成功但任务始终无法推进"的形态。
+        仅处理 ASSIGNED（尚未取货）任务；料箱/点位认领保持不变（防双重认领）。
+        """
+        if not self.govern_reassign:
+            return
+        d = self.dispatcher
+        for task in list(d.tasks.values()):
+            if task.state != TaskState.ASSIGNED:
+                continue
+            v = self.vehicles.get(task.assigned_vehicle)
+            if v is None:
+                continue
+            task.stall_ticks = v.stall_ticks
+            if self.tick_n - task.last_progress_tick < cfg.REASSIGN_TICKS:
+                continue
+            task.assigned_vehicle = None
+            task.state = TaskState.QUEUED
+            task.reassign_count += 1
+            d.ledger_reassigned += 1
+            d.task_queue.append(task.id)
+            if v.task is task:
+                v.task = None
+            v.path = []
+            v.state = VehicleState.IDLE
+            changed_v.add(v.id)
+            events.append({"kind": "governance_event", "action": "reassigned",
+                           "vehicles": [v.id],
+                           "detail": f"task #{task.id} no progress "
+                                     f"{cfg.REASSIGN_TICKS}+ ticks, reassigned"})
+
     def _make_way(self, v: Vehicle, changed_v: set[int]) -> bool:
         """空闲/等待车短距离避让（FR-028 例外移动）。"""
         for cand in self._neighbors(v.cell):
@@ -802,31 +1150,45 @@ class Engine:
     # ---- 冲突事件（FR-022）----
 
     def _conflict_detection(self):
-        """互堵判定：等待关系图中 ≥2 台车成团（含互等环）。"""
+        """互堵判定：等待关系图中 ≥2 台车成团（含互等环）。
+
+        002 期口径修正（SC-003 可比性）：仅"阻挡车本身未推进"（≥ CONFLICT_BLOCK_TICKS
+        无位移）的等待边才计入互堵——002 硬件模型下载货车 0.35~0.7 格/tick，跟车等待
+        属正常交通行为而非互堵；001 期 1 格/tick 下该情形不存在，不过滤则同口径频次
+        虚高一个量级。
+        """
         if not self._wait_graph:
             clusters = []
         else:
-            nodes = set(self._wait_graph) | set(self._wait_graph.values())
-            nodes = {n for n in nodes if n in self.vehicles}
-            adj = {n: set() for n in nodes}
-            for a, b in self._wait_graph.items():
-                if a in nodes and b in nodes:
-                    adj[a].add(b)
-                    adj[b].add(a)
-            seen, clusters = set(), []
-            for n in nodes:
-                if n in seen:
-                    continue
-                comp, stack = set(), [n]
-                while stack:
-                    cur = stack.pop()
-                    if cur in comp:
+            blocked_edges = {
+                (a, b) for a, b in self._wait_graph.items()
+                if b in self.vehicles
+                and self.tick_n - self.vehicles[b].last_move_tick
+                >= cfg.CONFLICT_BLOCK_TICKS
+            }
+            if not blocked_edges:
+                clusters = []
+            else:
+                nodes = {n for edge in blocked_edges for n in edge}
+                adj = {n: set() for n in nodes}
+                for a, b in blocked_edges:
+                    if a in nodes and b in nodes:
+                        adj[a].add(b)
+                        adj[b].add(a)
+                seen, clusters = set(), []
+                for n in nodes:
+                    if n in seen:
                         continue
-                    comp.add(cur)
-                    stack.extend(adj[cur] - comp)
-                seen |= comp
-                if len(comp) >= 2:
-                    clusters.append(frozenset(comp))
+                    comp, stack = set(), [n]
+                    while stack:
+                        cur = stack.pop()
+                        if cur in comp:
+                            continue
+                        comp.add(cur)
+                        stack.extend(adj[cur] - comp)
+                    seen |= comp
+                    if len(comp) >= 2:
+                        clusters.append(frozenset(comp))
         for ev in self._active_conflicts:
             for cl in clusters:
                 if ev.vehicles and cl & set(ev.vehicles):
@@ -835,11 +1197,7 @@ class Engine:
         for cl in clusters:
             if not any(cl & set(ev.vehicles) for ev in self._active_conflicts):
                 vids = sorted(cl)
-                self._active_conflicts.append(ConflictEvent(
-                    start_tick=self.tick_n, vehicles=vids,
-                    positions=[self.vehicles[v].cell for v in vids],
-                    carried=[self.vehicles[v].carrying is not None for v in vids]))
-                vids = sorted(cl)
+                # （002 T045 修复存量 bug：此处曾重复 append 两次，互堵事件被双倍计数）
                 self._active_conflicts.append(ConflictEvent(
                     start_tick=self.tick_n, vehicles=vids,
                     positions=[self.vehicles[v].cell for v in vids],
@@ -857,6 +1215,7 @@ class Engine:
             dur = ev.end_tick - ev.start_tick
             if dur >= cfg.CONFLICT_MIN_TICKS:
                 self.conflict_events.append(ev)
+                self._conflict_end_log.append(ev.end_tick)
                 self._update_hotspots(ev)
                 if self._conflict_fh:
                     self._conflict_fh.write(json.dumps(ev.to_json(), ensure_ascii=False) + "\n")
@@ -901,10 +1260,10 @@ class Engine:
             "grid": {
                 "size": g.size,
                 "slots": [list(c) for c in g.slots],
-                "inbound": {"rows": list(cfg.INBOUND_ROW_RANGE),
-                            "cols": list(cfg.INBOUND_COL_RANGE)},
-                "outbound": {"rows": list(cfg.OUTBOUND_ROW_RANGE),
-                             "cols": list(cfg.OUTBOUND_COL_RANGE)},
+                "inbound": {"rows": list(g.inbound_rows),
+                            "cols": list(g.inbound_cols)},
+                "outbound": {"rows": list(g.outbound_rows),
+                             "cols": list(g.outbound_cols)},
                 "charging_area": {
                     "piles": [list(c) for c in g.charging.piles],
                     "entry": [list(c) for c in g.charging.entry_lane],
@@ -919,6 +1278,8 @@ class Engine:
                                g.charging.pile_owner.items() if vid is not None},
                 "queue": list(g.charging.queue)},
             "metrics": self._metrics(),
+            "ledger": self.dispatcher.ledger(),
+            "metrics_history": list(self.metrics_history)[-360:],
         }
 
     def _vehicle_json(self, v: Vehicle) -> dict:
@@ -964,6 +1325,11 @@ class Engine:
                       "pickup": list(v.task.pickup), "dropoff": list(v.task.dropoff),
                       "state": v.task.state.value} if v.task else None)
         d["need_charge"] = v.need_charge
+        d["progress"] = round(v.progress, 3)
+        d["defer_charge"] = v.defer_charge
+        d["reassign_count"] = v.task.reassign_count if v.task else 0
+        d["state_history"] = [{"tick": t, "state": s}
+                              for t, s in self._state_hist.get(v.id, [])]
         return d
 
     # ---- 障碍物操作（FR-009/010/011，契约 rest-api.md）----
@@ -1019,8 +1385,16 @@ class Engine:
         self.planner.hotspots.clear()
         self._recover_cooldown.clear()
         self._plan_fail_tick.clear()
+        self._charge_try_tick.clear()
+        self._charge_retry_tick.clear()
         self._park_try_tick.clear()
         self._parked_ok.clear()
         self.conflict_events.clear()
         self._active_conflicts.clear()
+        self.metrics_history.clear()
+        self._done_cum_log.clear()
+        self._cycle_log.clear()
+        self._conflict_end_log.clear()
+        self._done_base_cum = 0
+        self._state_hist.clear()
         self._init_world()

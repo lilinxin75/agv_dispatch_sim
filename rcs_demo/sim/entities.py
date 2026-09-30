@@ -68,6 +68,11 @@ class Vehicle:
     moved_this_tick: bool = False
     wait_reason: Optional[int] = None       # 等待因谁（对方 vehicle_id，冲突检测用）
 
+    # ---- 002 期扩展（FR-006/009，data-model.md Vehicle）----
+    progress: float = 0.0                   # 位移进度累加器（≥1 才移动一格）
+    defer_charge: bool = False              # 错峰充电延迟标记（队列满时置位）
+    last_move_tick: int = -10**9            # 最近一次实际位移时刻（互堵判定口径）
+
     def is_moving_state(self) -> bool:
         return self.state in (
             VehicleState.TO_PICKUP,
@@ -102,6 +107,13 @@ class Task:
     tote_id: int
     state: TaskState = TaskState.QUEUED
     assigned_vehicle: Optional[int] = None
+    # ---- 002 期扩展（FR-001/002，data-model.md Task）----
+    created_tick: int = 0            # 生成时刻（平均任务周期口径）
+    done_tick: Optional[int] = None  # 完成时刻
+    assigned_tick: int = 0           # 最近一次派发时刻
+    last_progress_tick: int = 0      # 执行车最近一次移动时刻（无进度改派口径）
+    stall_ticks: int = 0             # 执行车停滞计数（同步自 vehicle.stall_ticks）
+    reassign_count: int = 0          # 改派次数
 
 
 @dataclass

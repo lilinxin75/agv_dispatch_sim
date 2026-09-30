@@ -17,7 +17,9 @@
 
   <div id="toolbar">
     <button id="btn-pause">暂停</button>
-    <button id="btn-trails" title="显示/隐藏小车移动轨迹尾迹（FR-032）">轨迹:开</button>
+    <button id="btn-trails" title="显示/隐藏小车移动轨迹尾迹（随时间蒸发，FR-025）">轨迹:开</button>
+    <button id="btn-goals" title="显示/隐藏车辆到当前目标的直连线（FR-021）">目标连线:关</button>
+    <button id="btn-heat" title="显示/隐藏拥塞热力图（历史拥堵热点，FR-020）">热力图:关</button>
     <button id="btn-reset-view">复位视图</button>
     <button id="btn-reset-sim" title="重置仿真到初始布局">重置仿真</button>
     <span id="tick-label">tick 0</span>
@@ -37,6 +39,13 @@
         <div class="stat"><span class="v" id="m-conn">—</span><span class="k">连接状态</span></div>
       </div>
       <div id="per-vehicle" class="small">各车完成数：—</div>
+      <div class="trend-box">
+        <div class="trend-head small">
+          <span id="trend-title">吞吐趋势（窗口完成数）</span>
+          <button id="btn-trend-switch" class="mini">切换</button>
+        </div>
+        <canvas id="trend-canvas" width="260" height="60"></canvas>
+      </div>
     </div>
 
     <div class="panel hidden" id="vehicle-panel">

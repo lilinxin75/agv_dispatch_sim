@@ -1,0 +1,23 @@
+{
+  "name": "wide-oneway",
+  "description": "优化预设 1：环场主干道加宽至 3 格 + 货架南北缘局部单向段（半幅、留穿越缺口），配充电区 10 桩",
+  "grid": 200,
+  "shelf": {"row_range": [60, 139], "col_range": [40, 159]},
+  "inbound": {"row_range": [95, 104], "col_range": [0, 4]},
+  "outbound": {"row_range": [95, 104], "col_range": [195, 199]},
+  "charging": {
+    "row_range": [185, 193],
+    "col_range": [85, 114],
+    "piles": 10,
+    "entry_cols": [86, 88],
+    "exit_cols": [112, 114]
+  },
+  "standby_zones": [],
+  "oneway_segments": [
+    {"row_range": [140, 140], "col_range": [40, 100], "direction": "E",
+     "comment": "货架南缘西半段东行（出库流向）；cols 101-159 保持双向可穿越"},
+    {"row_range": [59, 59], "col_range": [100, 159], "direction": "W",
+     "comment": "货架北缘东半段西行（入库流向）；cols 40-99 保持双向可穿越"}
+  ],
+  "ring_road_width": 3
+}

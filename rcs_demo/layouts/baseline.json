@@ -1,0 +1,18 @@
+{
+  "name": "baseline",
+  "description": "001 期现状布局：2 格宽环场主干道、双向通道、10 充电位",
+  "grid": 200,
+  "shelf": {"row_range": [60, 139], "col_range": [40, 159]},
+  "inbound": {"row_range": [95, 104], "col_range": [0, 4]},
+  "outbound": {"row_range": [95, 104], "col_range": [195, 199]},
+  "charging": {
+    "row_range": [185, 193],
+    "col_range": [85, 114],
+    "piles": 10,
+    "entry_cols": [86, 88],
+    "exit_cols": [112, 114]
+  },
+  "standby_zones": [],
+  "oneway_segments": [],
+  "ring_road_width": 2
+}

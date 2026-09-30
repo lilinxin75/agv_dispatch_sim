@@ -25,9 +25,22 @@ let toteCells = new Map();   // "r,c" -> tote（静置料箱）
 let carriedTotes = new Map(); // vehicle_id -> tote_id
 let events = [];
 let watchedId = null;
+let curTick = 0;               // 当前服务端 tick（轨迹年龄/热力衰减用）
 let paused = false;
 let showTrails = true;          // 轨迹开关（FR-032，默认开启）
-const TRAIL_LEN = 30;           // 尾迹长度（tick，≈3 秒 @10tick/s）
+let showGoals = false;          // 目标连线开关（FR-021，默认隐藏）
+let showHeat = false;           // 拥塞热力图开关（FR-020，默认关闭）
+let trailTtl = 30;              // 轨迹消失时长（tick，FR-025；读 /api/config）
+const heat = new Map();         // "r,c" -> 热度值（拥塞热力，帧衰减）
+
+// 五态着色（FR-018 / research.md D10）：执行任务/等待/充电/空闲/受阻
+function stateColor(st) {
+  if (st === "to_pickup" || st === "to_dropoff") return "#3b82f6"; // 执行任务=蓝
+  if (st === "waiting") return "#f59e0b";                          // 等待=橙
+  if (st === "to_charge" || st === "charging") return "#10b981";   // 充电=绿
+  if (st === "stalled") return "#ef4444";                          // 受阻=红
+  return "#9ca3af";                                                // 空闲/让路=灰
+}
 
 // ---- 相机 ----
 const cam = { scale: 1, x: 0, y: 0 };
@@ -111,6 +124,13 @@ window.addEventListener("resize", resize);
 // ---- 渲染循环 ----
 let lastFrame = performance.now();
 function frame(now) {
+  // 热度帧衰减（FR-020）：历史占用热度随时间冷却
+  if (showHeat || heat.size) {
+    for (const [k, val] of heat) {
+      const nv = val * 0.995;
+      if (nv < 0.05) heat.delete(k); else heat.set(k, nv);
+    }
+  }
   const dt = Math.min((now - lastFrame) / 1000, 0.1);
   lastFrame = now;
   // 车辆插值（10 格/秒，与 tick 同步）
@@ -145,9 +165,20 @@ function render() {
   const r0 = Math.max(0, Math.floor(wy0 / CELL) - 1), r1 = Math.min(GRID - 1, Math.ceil(wy1 / CELL) + 1);
   const c0 = Math.max(0, Math.floor(wx0 / CELL) - 1), c1 = Math.min(GRID - 1, Math.ceil(wx1 / CELL) + 1);
 
-  // 轨迹尾迹（FR-032）：每车最近 N tick 移动路径，半透明渐隐，绘制在小车层之下。
-  // 性能：按 alpha 分 4 档归并为 4 条路径描边（逐段 beginPath/stroke 在
-  // 100 车 × 30 段时约 3000 次调用/帧，是初始化阶段卡顿的主因之一）。
+  // 拥塞热力图层（FR-020）：历史占用热度半透明覆盖，关闭即不渲染
+  if (showHeat) {
+    for (const [key, val] of heat) {
+      const [hr, hc] = key.split(",").map(Number);
+      if (hr < r0 || hr > r1 || hc < c0 || hc > c1) continue;
+      const a = Math.min(0.45, val * 0.10);
+      if (a < 0.02) continue;
+      ctxD.fillStyle = `rgba(255,${Math.max(40, 170 - val * 26) | 0},20,${a})`;
+      ctxD.fillRect(hc * CELL, hr * CELL, CELL, CELL);
+    }
+  }
+
+  // 轨迹尾迹（FR-025）：时间蒸发——点位按产生时间渐隐（非固定长度拖尾）。
+  // 性能：按 alpha 分 4 档归并为 4 条路径描边。
   if (showTrails) {
     const BUCKETS = 4;
     const paths = Array.from({ length: BUCKETS }, () => new Path2D());
@@ -157,17 +188,43 @@ function render() {
       if (tr[tr.length - 1].x < c0 - 2 || tr[tr.length - 1].x > c1 + 2 ||
           tr[tr.length - 1].y < r0 - 2 || tr[tr.length - 1].y > r1 + 2) continue;
       const n = tr.length;
+      const nowTick = curTick;
       for (let i = 1; i < n; i++) {
-        const b = Math.min(BUCKETS - 1, Math.floor((i / n) * BUCKETS));
+        // 旧点更透明：按点位年龄分桶（时间蒸发语义，FR-025）
+        const age = nowTick - tr[i].t;
+        const b = Math.min(BUCKETS - 1, Math.floor((age / trailTtl) * BUCKETS));
         paths[b].moveTo(tr[i - 1].x * CELL + CELL / 2, tr[i - 1].y * CELL + CELL / 2);
         paths[b].lineTo(tr[i].x * CELL + CELL / 2, tr[i].y * CELL + CELL / 2);
       }
     }
     ctxD.lineWidth = Math.max(1, 1.5 / cam.scale);
     for (let b = 0; b < BUCKETS; b++) {
-      ctxD.strokeStyle = `rgba(140,180,255,${((b + 1) / BUCKETS) * 0.30})`;
+      // b=0 最新（最不透明）……b=3 最旧（接近消失）
+      ctxD.strokeStyle = `rgba(140,180,255,${0.32 - b * 0.09})`;
       ctxD.stroke(paths[b]);
     }
+  }
+
+  // 目标点连线（FR-021，拍板 Q1-A：车→当前最终目标的直连线，虚线）
+  if (showGoals) {
+    ctxD.save();
+    ctxD.setLineDash([3, 3]);
+    ctxD.lineWidth = Math.max(0.8, 1 / cam.scale);
+    ctxD.strokeStyle = "rgba(140,180,255,0.45)";
+    for (const v of vehicleVis.values()) {
+      if (!v.goal) continue;
+      ctxD.beginPath();
+      ctxD.moveTo(v.x * CELL + CELL / 2, v.y * CELL + CELL / 2);
+      ctxD.lineTo(v.goal[1] * CELL + CELL / 2, v.goal[0] * CELL + CELL / 2);
+      ctxD.stroke();
+      // 目标端小十字
+      const gx = v.goal[1] * CELL + CELL / 2, gy = v.goal[0] * CELL + CELL / 2;
+      ctxD.beginPath();
+      ctxD.moveTo(gx - 2, gy); ctxD.lineTo(gx + 2, gy);
+      ctxD.moveTo(gx, gy - 2); ctxD.lineTo(gx, gy + 2);
+      ctxD.stroke();
+    }
+    ctxD.restore();
   }
 
   // 静置料箱（半透明方块，FR-019）
@@ -178,19 +235,12 @@ function render() {
     ctxD.fillRect(col * CELL + 1, r * CELL + 1, CELL - 2, CELL - 2);
   }
 
-  // 小车（带编号圆点）
+  // 小车（带编号圆点 + 电量条，FR-018/019）
   const drawLabels = cam.scale > 0.5;
   for (const [id, v] of vehicleVis) {
     const px = v.x * CELL + CELL / 2, py = v.y * CELL + CELL / 2;
     if (v.x < c0 - 1 || v.x > c1 + 1 || v.y < r0 - 1 || v.y > r1 + 1) continue;
-    let color = "#4cc38a";                      // idle
-    if (v.state === "to_pickup") color = "#e8b84c";
-    else if (v.state === "to_dropoff") color = "#4c9de8";
-    else if (v.state === "to_charge") color = "#b07ce8";
-    else if (v.state === "charging") color = "#8a5cd6";
-    else if (v.state === "waiting") color = "#8b93a3";
-    else if (v.state === "stalled") color = "#e85c5c";
-    else if (v.state === "making_way") color = "#5cd6c0";
+    const color = stateColor(v.state);   // 五态着色（FR-018）
     // 携送料箱：车下画跟随料箱框（FR-019）
     if (v.carrying) {
       ctxD.fillStyle = "rgba(120,170,255,0.5)";
@@ -200,9 +250,25 @@ function render() {
     ctxD.arc(px, py, Math.max(2.4, CELL * 0.34), 0, Math.PI * 2);
     ctxD.fillStyle = color;
     ctxD.fill();
-    if (v.state === "charging") { // 充电标识
+    // 车载电量条（FR-019）：车体下缘 2px，宽度=电量%，低电警示色
+    if (v.battery !== undefined && cam.scale > 0.35) {
+      const pct = Math.max(0, Math.min(1, v.battery / 1000));
+      const bw = CELL * 0.8;
+      const by = v.y * CELL + CELL - 0.5;
+      ctxD.fillStyle = "rgba(0,0,0,0.4)";
+      ctxD.fillRect(px - bw / 2, by, bw, 1.6);
+      ctxD.fillStyle = pct < 0.10 ? "#ef4444" : (pct < 0.20 ? "#f59e0b" : "#34d399");
+      ctxD.fillRect(px - bw / 2, by, bw * pct, 1.6);
+    }
+    if (v.state === "charging") { // 充电指示 ⚡（FR-019）
       ctxD.strokeStyle = "#ffd76b"; ctxD.lineWidth = 1.2;
       ctxD.beginPath(); ctxD.arc(px, py, CELL * 0.5, 0, Math.PI * 2); ctxD.stroke();
+      if (cam.scale > 1.0) {
+        ctxD.fillStyle = "#ffd76b";
+        ctxD.font = "bold 5px sans-serif";
+        ctxD.textAlign = "center"; ctxD.textBaseline = "middle";
+        ctxD.fillText("⚡", px, py - CELL * 0.75);
+      }
     }
     if (v.state === "stalled") { // 受阻高亮
       ctxD.strokeStyle = "#ff8080"; ctxD.lineWidth = 1.5;
@@ -325,6 +391,7 @@ function connectWS() {
 
 function applySnapshot(m) {
   world = m;
+  curTick = m.tick;
   obstacles = new Set(m.grid.obstacles.map(p => p[0] + "," + p[1]));
   toteCells.clear(); carriedTotes.clear();
   for (const t of m.totes) {
@@ -336,8 +403,9 @@ function applySnapshot(m) {
     vehicleVis.set(v.id, { x: v.cell[1], y: v.cell[0], tx: v.cell[1], ty: v.cell[0],
       trail: [{ x: v.cell[1], y: v.cell[0], t: m.tick }],
       state: v.state, battery: v.battery, completed: v.completed,
-      carrying: carriedTotes.has(v.id) });
+      goal: null, carrying: carriedTotes.has(v.id) });
   }
+  heat.clear();
   drawObstacles();
   updateMetrics(m.metrics);
   document.getElementById("tick-label").textContent = "tick " + m.tick;
@@ -360,17 +428,24 @@ function applyDelta(m) {
     if (last && Math.abs(v.tx - last.x) + Math.abs(v.ty - last.y) > 1) v.trail = [];
     else if (!last || last.x !== v.tx || last.y !== v.ty) {
       v.trail.push({ x: v.tx, y: v.ty, t: m.tick });
-      if (v.trail.length > TRAIL_LEN) v.trail.shift();
+      // （FR-025）无计数上限：唯一淘汰口径是点位年龄超 trailTtl
     }
     v.state = dv.state;
     if (dv.battery !== undefined) v.battery = dv.battery;
+    // 目标点（FR-021）：随目标变化更新；null 显式清除
+    v.goal = dv.goal !== undefined ? dv.goal : v.goal;
   }
-  // 轨迹老化（FR-032 停顿渐消）：每 tick 对全部车辆扫描，按点位记录时间
-  // 淘汰过期点——停下的车尾迹从远端逐渐缩短直至消失（点位按 tick 单调，
-  // while-shift 无分配开销）
+  curTick = m.tick;
+  // 热度累积（FR-020）：车辆所在格 +1（渲染侧按帧衰减）
+  for (const v of vehicleVis.values()) {
+    const key = Math.round(v.y) + "," + Math.round(v.x);
+    heat.set(key, (heat.get(key) || 0) + 1);
+  }
+  // 轨迹老化（FR-025 时间蒸发）：点位年龄超 TTL 即淘汰（唯一下界，
+  // 无计数上限）——静止车辆尾迹逐渐缩短消失，行进刷新同样受时间约束
   for (const v of vehicleVis.values()) {
     const tr = v.trail;
-    while (tr && tr.length && m.tick - tr[0].t > TRAIL_LEN) tr.shift();
+    while (tr && tr.length && m.tick - tr[0].t > trailTtl) tr.shift();
   }
   for (const dt of m.totes) {
     if (dt.state === "docked" && Array.isArray(dt.at)) {
@@ -433,10 +508,20 @@ function showVehicleDetail(v) {
     ? `${v.task.type === "inbound" ? "入库" : "出库"} #${v.task.id} (${v.task.pickup}→${v.task.dropoff})`
     : "无";
   const pct = Math.round(v.battery / 10);
+  // 最近状态变化时间（FR-022）
+  const hist = v.state_history || [];
+  const lastChange = hist.length
+    ? hist[hist.length - 1]
+    : null;
+  const lastChangeStr = lastChange
+    ? `${stateNames[lastChange.state] || lastChange.state} @ tick ${lastChange.tick}`
+    : "—";
   document.getElementById("vehicle-info").innerHTML =
     `编号 <b>#${v.id}</b> · ${stateNames[v.state] || v.state}<br>` +
-    `位置 (${v.cell}) · 电量 ${v.battery} (${pct}%)${v.need_charge ? " ⚠需充电" : ""}<br>` +
-    `已完成任务 ${v.completed} 件<br>当前任务：${task}<br>路径剩余：${v.path ? v.path.length : 0} 格`;
+    `位置 (${v.cell}) · 电量 ${v.battery} (${pct}%)${v.need_charge ? " ⚠需充电" : ""}` +
+    `${v.defer_charge ? " · ⏸错峰延迟充电" : ""}<br>` +
+    `已完成任务 ${v.completed} 件<br>当前任务：${task}<br>路径剩余：${v.path ? v.path.length : 0} 格` +
+    `<br>最近状态变化：${lastChangeStr}`;
 }
 
 document.getElementById("btn-close-vehicle").onclick = () => selectVehicle(null);
@@ -447,10 +532,16 @@ function addEvent(m) {
   if (events.length > 30) events.pop();
   const kindNames = { stall_detected: "受阻", stall_recovered: "恢复", task_blocked: "任务受阻",
     task_unblocked: "任务恢复", charge_started: "开始充电", charge_done: "充电完成",
-    charge_queued: "充电排队" };
+    charge_queued: "充电排队", governance_event: "治理动作" };
+  const actionNames = { reassigned: "任务改派", backpressure: "生成限流",
+    charge_deferred: "错峰充电", rerouted: "重规划绕行" };
   const el = document.getElementById("event-feed");
   el.innerHTML = events.map(e =>
-    `<div>tick ${e.tick} · ${kindNames[e.kind] || e.kind}${e.vehicle_id ? ` · 车#${e.vehicle_id}` : ""}${e.detail ? ` (${e.detail})` : ""}</div>`
+    `<div>tick ${e.tick} · ${kindNames[e.kind] || e.kind}` +
+    `${e.action ? `(${actionNames[e.action] || e.action})` : ""}` +
+    `${e.vehicle_id ? ` · 车#${e.vehicle_id}` : ""}` +
+    `${e.vehicles ? ` · 车${e.vehicles.map(x => "#" + x).join(",")}` : ""}` +
+    `${e.detail ? ` (${e.detail})` : ""}</div>`
   ).join("");
 }
 
@@ -465,6 +556,61 @@ document.getElementById("btn-trails").onclick = (e) => {
   showTrails = !showTrails;
   e.target.textContent = showTrails ? "轨迹:开" : "轨迹:关";
 };
+document.getElementById("btn-goals").onclick = (e) => {
+  showGoals = !showGoals;
+  e.target.textContent = showGoals ? "目标连线:开" : "目标连线:关";
+};
+document.getElementById("btn-heat").onclick = (e) => {
+  showHeat = !showHeat;
+  e.target.textContent = showHeat ? "热力图:开" : "热力图:关";
+};
+
+// ---- 指标趋势图（FR-023）：metrics_history 驱动，可切吞吐/平均周期 ----
+let trendMode = 0;  // 0=吞吐（窗口完成数） 1=平均任务周期
+const trendNames = ["吞吐趋势（窗口完成数）", "任务平均周期（tick）"];
+
+function drawTrend(history) {
+  const cv = document.getElementById("trend-canvas");
+  const c = cv.getContext("2d");
+  c.clearRect(0, 0, cv.width, cv.height);
+  if (!history || history.length < 2) return;
+  const key = trendMode === 0 ? "throughput_window" : "avg_cycle_ticks";
+  const vals = history.map(h => h[key] || 0);
+  const mx = Math.max(...vals, 1);
+  c.strokeStyle = trendMode === 0 ? "#4c9de8" : "#e8b84c";
+  c.lineWidth = 1.2;
+  c.beginPath();
+  vals.forEach((val, i) => {
+    const x = (i / (vals.length - 1)) * (cv.width - 4) + 2;
+    const y = cv.height - 3 - (val / mx) * (cv.height - 8);
+    if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+  });
+  c.stroke();
+  c.fillStyle = "#8b93a3";
+  c.font = "9px sans-serif";
+  c.textAlign = "right";
+  c.fillText(`max ${Math.round(mx)}`, cv.width - 4, 10);
+}
+
+document.getElementById("btn-trend-switch").onclick = () => {
+  trendMode = 1 - trendMode;
+  document.getElementById("trend-title").textContent = trendNames[trendMode];
+  refreshTrend();
+};
+
+async function refreshTrend() {
+  try {
+    const r = await fetch("/api/state");
+    const s = await r.json();
+    drawTrend(s.metrics_history);
+  } catch (err) { /* 断线时静默（WS 重连后自动恢复） */ }
+}
+setInterval(refreshTrend, 5000);
+
+// ---- 启动参数（FR-025：轨迹消失时长可配置）----
+fetch("/api/config").then(r => r.json()).then(c => {
+  if (c.trail_ttl_ticks) trailTtl = c.trail_ttl_ticks;
+}).catch(() => {});
 document.getElementById("btn-reset-sim").onclick = async () => {
   await api("POST", "/api/reset");
   selectVehicle(null);

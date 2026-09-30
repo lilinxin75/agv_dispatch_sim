@@ -38,17 +38,29 @@ python3 -m rcs_demo --layout charge-expanded --seed 42 &
 预期：三套均可启动且 `--check` 通过；wide-oneway 热点频次或吞吐可量化优于 baseline
 （指标面板/冲突分析工具对比）；charge-expanded 充电排队深度峰值低于 baseline。
 
-## ③ 效率双口径验收（US4，SC-001/SC-003）
+## ③ 效率双口径验收（US4，SC-001/SC-003；快慢分层，FR-026/FR-027）
+
+**快（迭代验证，分钟级）**：headless 批量推进——`Engine.tick()` 纯同步驱动，不受
+墙钟限制（实测全程 ~120× 实时）：
 
 ```bash
-python3 -m rcs_demo --seed 42 &   # 连续 60 分钟不重启
+python3 -m rcs_demo.acceptance --ticks 8000 --report-dir logs/acc_smoke
 ```
 
-- 主口径：后 30 分钟平均吞吐（指标面板趋势图/`GET /api/state` metrics_history）
-  ≥ 前 10 分钟峰值的 80%
-- 辅口径：等待/受阻占比峰值 < 30%
-- 全程零碰撞、零电量归零停摆（SC-006）
-- 互堵频次（`python3 -m rcs_demo.analyze_conflicts logs/conflicts_*.jsonl`）
+**慢（收尾验收，一次）**：36000 tick（仿真 60 分钟）全场景，同一入口（FR-027
+过程监控内建：逐窗口 marks.jsonl 落盘；命中碰撞/tick 成本失控/吞吐停摆/电量
+滞零/台账恒等式任一异常判据立即中止 exit 2 并写 anomaly.json，修复后从头重跑）：
+
+```bash
+python3 -m rcs_demo.acceptance --ticks 36000 --seed 42 --report-dir logs/acc_final
+```
+
+核对双口径（summary.json / 控制台摘要）：
+
+- 主口径：后 30 分钟平均吞吐（sc001_ratio）≥ 前 10 分钟峰值的 80%
+- 辅口径：marks.jsonl waiting 峰值 < 30%
+- 全程零碰撞（监控自动判据）、零电量归零停摆（滞零 >900 tick 自动中止，SC-006）
+- 互堵频次（`python3 -m rcs_demo.analyze_conflicts logs/acc_final/conflicts/*.jsonl`）
   较 001 期同种子基线下降 ≥30%（SC-003）
 
 ## ④ 显示效果人工核验清单（US5，SC-005）

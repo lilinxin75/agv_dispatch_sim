@@ -38,8 +38,9 @@ class ChargingManager:
     # ---- 排队管理（FR-026）----
 
     def enqueue(self, vid: int, battery: float):
-        self.area.queue.append(vid)
-        self.events.append(("charge_queued", vid))
+        if vid not in self.area.queue:  # 去重：重复 enqueue 会虚增排队深度（错峰误判）
+            self.area.queue.append(vid)
+            self.events.append(("charge_queued", vid))
 
     def dequeue_for_pile(self, batteries: dict[int, float]) -> tuple[int, Cell] | None:
         """桩空出时取队首：电量更低者优先（FR-026）。"""

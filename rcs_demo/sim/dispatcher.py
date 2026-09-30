@@ -29,14 +29,62 @@ class Dispatcher:
         self.ticks_since_gen = 0
         self._claimed_totes: set[int] = set()   # 已被任务认领的料箱
         self._claimed_slots: set[Cell] = set()  # 已被入库任务认领的空点位
+        # ---- 002 期：任务台账（FR-001，恒等式 spawned == done+active+queued+reassigned）----
+        self.ledger_spawned = 0
+        self.ledger_done = 0
+        self.ledger_reassigned = 0  # 改派后待重派的任务数（重派时回收，守恒）
+        # ---- 002 期：拥塞背压（FR-005，research.md D5）----
+        self.bp_multiplier = 1.0
+        self.bp_congested = False
+        self.bp_relief_ticks = 0
+        self.bp_pressure_ticks = 0  # 连续拥塞压力计数（去抖：100 tick 才升一档）
+        self.governance_events: list[dict] = []  # 引擎消费进事件流
+
+    def update_backpressure(self, waiting_ratio: float, active_tasks: int,
+                            max_active: int):
+        """生成节奏自适应（去抖设计）：拥塞持续 BP_PRESSURE_TICKS 才 ×2（上限 ×8），
+        持续缓解 METRICS_WINDOW_TICKS 后减半回落——避免瞬时抖动长期压制生成节奏。"""
+        congested = (waiting_ratio >= cfg.BACKPRESSURE_WAIT_RATIO
+                     or active_tasks >= max_active)
+        if congested:
+            self.bp_pressure_ticks += 1
+            if self.bp_pressure_ticks >= cfg.BACKPRESSURE_PRESSURE_TICKS:
+                self.bp_pressure_ticks = 0
+                if self.bp_multiplier < 8.0:
+                    self.bp_multiplier = min(8.0, max(2.0, self.bp_multiplier * 2.0))
+                    if not self.bp_congested:
+                        self.bp_congested = True
+                        self.governance_events.append(
+                            {"kind": "governance_event", "action": "backpressure",
+                             "detail": f"spawn interval x{self.bp_multiplier:g}"})
+            self.bp_relief_ticks = 0
+        else:
+            self.bp_pressure_ticks = 0
+            self.bp_relief_ticks += 1
+            if self.bp_congested and self.bp_relief_ticks >= cfg.METRICS_WINDOW_TICKS:
+                self.bp_multiplier = max(1.0, self.bp_multiplier * 0.5)
+                self.bp_relief_ticks = 0
+                if self.bp_multiplier == 1.0:
+                    self.bp_congested = False
+
+    def drain_governance_events(self) -> list[dict]:
+        ev = self.governance_events
+        self.governance_events = []
+        return ev
+
+    def mark_done(self, task: Task, tick: int):
+        """任务完成入账（引擎 _dropoff 调用）。"""
+        self.ledger_done += 1
+        task.done_tick = tick
 
     # ---- 任务生成（FR-003/FR-018）----
 
     def maybe_generate(self, tick: int, totes: dict[int, Tote],
                        inbound_pool: list[int]):
-        """每秒生成 1 个任务，入库/出库交替（成对 1:1）。"""
+        """每 1/TASKS_PER_SECOND 秒生成 1 个任务（×背压倍率），入库/出库交替。"""
         self.ticks_since_gen += 1
-        if self.ticks_since_gen < cfg.TICK_RATE / max(cfg.TASKS_PER_SECOND, 1e-9):
+        interval = cfg.TICK_RATE / max(cfg.TASKS_PER_SECOND, 1e-9) * self.bp_multiplier
+        if self.ticks_since_gen < interval:
             return
         self.ticks_since_gen = 0
         # 入库优先级翻转，保证两种都可行时交替生成
@@ -82,9 +130,10 @@ class Dispatcher:
             self.generated_out += 1
         t = Task(id=self.next_task_id, type="inbound" if inbound else "outbound",
                  pickup=pickup, dropoff=dropoff, tote_id=tote_id,
-                 state=TaskState.QUEUED)
+                 state=TaskState.QUEUED, created_tick=tick)
         self.next_task_id += 1
         self.tasks[t.id] = t
+        self.ledger_spawned += 1
         return t
 
     @staticmethod
@@ -142,12 +191,47 @@ class Dispatcher:
         return task
 
     def unassign(self, task: Task):
-        """任务回收重派（死锁恢复 c 步）。"""
+        """任务回收重派（死锁恢复 c 步/临界电量改道/取货失败）。
+
+        002 FR-002：回收即一次改派——reassign_count 永久累计，
+        ledger_reassigned 为改派事件单调计数（观测口径）。
+        IN_PROGRESS 回收的料箱归属：出库任务就地落箱后料箱仍归属本任务
+        （重新认领防抢占）；入库任务回队列后重领新箱（清 stale 引用）。
+        """
         if task.assigned_vehicle is not None:
             task.assigned_vehicle = None
+            task.reassign_count += 1
+            self.ledger_reassigned += 1
+            if task.state == TaskState.IN_PROGRESS:
+                if task.type == "inbound":
+                    task.tote_id = -1  # 重派后重新从入库口领箱
+                else:
+                    self._claimed_totes.add(task.tote_id)  # 落箱料箱仍归属本任务
         task.state = TaskState.QUEUED
         self.task_queue.appendleft(task.id)
 
     def stats(self) -> dict:
         return {"generated_in": self.generated_in, "generated_out": self.generated_out,
                 "queued": sum(1 for t in self.tasks.values() if t.state == TaskState.QUEUED)}
+
+    def ledger(self) -> dict:
+        """任务台账（FR-001 / contracts/api-delta.md）。
+
+        桶互斥派生（恒等式 spawned == done + active + queued + reassigned）：
+        queued=从未派发的待派任务；reassigned=改派后待重派任务；
+        reassign_events=改派事件单调累计数（观测口径）。
+        """
+        from .entities import TaskState as TS
+        active = queued = requeued = 0
+        for t in self.tasks.values():
+            if t.state in (TS.ASSIGNED, TS.IN_PROGRESS):
+                active += 1
+            elif t.state in (TS.QUEUED, TS.BLOCKED):
+                if t.reassign_count > 0:
+                    requeued += 1
+                else:
+                    queued += 1
+        return {"spawned": self.ledger_spawned, "active": active,
+                "queued": queued, "done": self.ledger_done,
+                "reassigned": requeued,
+                "reassign_events": self.ledger_reassigned}
