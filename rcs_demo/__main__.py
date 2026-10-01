@@ -34,29 +34,34 @@ def _check_layout(name: str) -> None:
         assert path is not None, f"A* 不可达: {start} -> {goal}"
         assert all(0 < r < n - 1 and 0 < c < n - 1 for r, c in path), "路径越界"
 
-    # 充电桩矢量性（FR-008）
+    # 充电桩矢量性（FR-008 倒车入位，2026-10-01 修订）
     for pile in grid.charging.piles:
-        conn = (pile[0] + 1, pile[1])
-        assert grid.kind[conn] == CellKind.CHARGE_IN, "连接格缺失"
-        # 入桩：仅自南向北、且必须为目标
-        assert grid.can_traverse(conn, pile, to_is_goal=True), "自连接格入桩应可行"
+        conn = (pile[0] - 1, pile[1])
+        assert grid.kind[conn] == CellKind.CHARGE_IN, "上方连接格缺失"
+        # 入桩：仅自北向南（经上方连接格）、且必须为目标
+        assert grid.can_traverse(conn, pile, to_is_goal=True), "自上方连接格入桩应可行"
         assert not grid.can_traverse((pile[0], pile[1] - 1), pile, to_is_goal=True), \
             "自西侧入桩必须被拒"
+        assert not grid.can_traverse((pile[0] + 1, pile[1]), pile, to_is_goal=True), \
+            "自南侧入桩必须被拒"
         assert not grid.can_traverse(conn, pile, to_is_goal=False), "穿越桩格必须被拒"
-        # 离桩：仅向南
-        assert grid.can_traverse(pile, conn), "自桩南离应可行"
-        assert not grid.can_traverse(pile, (pile[0], pile[1] + 1)), "自桩东离必须被拒"
-        # 到桩可达（排队/进站路径存在）
+        # 离桩：仅向北原路倒出
+        assert grid.can_traverse(pile, conn), "自桩向北倒出应可行"
+        assert not grid.can_traverse(pile, (pile[0], pile[1] + 1)), "自桩南离必须被拒"
+        # 到桩可达（上方进桩通道存在路径）
         assert planner.plan_any_dir(conn, pile, False, set()) is not None, "到桩不可达"
-    # 通道行单向：西→东可规划；出站段内不可向西逆行
-    lane_row = grid.charging.lane_row
-    c0 = grid.charge_cols[0]
-    west = (lane_row, c0 - 4)
-    east = (lane_row, grid.charge_cols[1] + 2)
-    assert planner.plan(west, east, "E", False, set()) is not None, "西→东进站方向不可达"
-    for cell in grid.charging.exit_lane:
-        assert not grid.can_traverse(cell, (cell[0], cell[1] - 1)), \
-            f"出站段 {cell} 向西逆行未被拒"
+        # 上方进桩通道可达每个桩位（从通道西端起规划）
+        approach = (pile[0] - 2, grid.charge_cols[0] + 1)
+        assert planner.plan_any_dir(approach, pile, False, set()) is not None, \
+            f"上方进桩通道到桩 {pile} 不可达"
+    # 上方进桩通道为普通双向通道：东西两端均可进入
+    approach_row = grid.charging.approach_row
+    c0, c1 = grid.charge_cols
+    for start_col, d in ((c0 - 4, "E"), (c1 + 2, "W")):
+        start = (approach_row, start_col)
+        goal = (approach_row, c0 + 5)
+        assert planner.plan_any_dir(start, goal, False, set()) is not None, \
+            f"上方进桩通道自 {start} 不可达（双向通道被破坏）"
     # 待命区容量（FR-014）：空槽位数 ≥ 车辆数（空闲峰值需求上界）
     assert len(grid.slots) >= cfg.VEHICLES, \
         f"待命容量不足：slots {len(grid.slots)} < vehicles {cfg.VEHICLES}"

@@ -136,12 +136,12 @@ class Planner:
                 ncell = (nr, nc)
                 if ncell in blocked or (carrying and ncell in docked):
                     continue
-                # 充电桩矢量性（002 FR-008，与引擎仲裁同源）：
-                # 桩格仅可作目标且只能自南向北进入；矢量规则格经白名单校验。
-                # 性能：绝大多数格子无矢量规则（非 vector_cells），直接放行，
-                # 避免 2.4 亿次/千 tick 级的 can_traverse 函数调用（profile 定位）
+                # 充电桩矢量性（002 FR-008 倒车入位，与引擎仲裁同源）：
+                # 桩格仅可作目标且只能自北向南（经上方连接格）进入；矢量规则格
+                # 经白名单校验。性能：绝大多数格子无矢量规则（非 vector_cells），
+                # 直接放行，避免 2.4 亿次/千 tick 级的 can_traverse 函数调用
                 if ncell in pile_cells:
-                    if ncell != goal or (r, c) != (nr + 1, nc):
+                    if ncell != goal or (r, c) != (nr - 1, nc):
                         continue
                 elif ((r, c) in vector_cells or ncell in vector_cells) \
                         and not can_traverse((r, c), ncell):

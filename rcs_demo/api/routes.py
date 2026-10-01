@@ -145,6 +145,15 @@ def create_app(engine: Engine, fast: bool = False) -> FastAPI:
 
     # ---- 静态前端（章程 II）----
 
+    # 演示期前端迭代频繁：静态资源禁用启发式缓存（no-cache = 每次回源校验，
+    # ETag 未变仍 304，不增加流量），避免改完 app.js 后浏览器仍跑旧脚本。
+    @app.middleware("http")
+    async def _no_cache_static(request, call_next):
+        response = await call_next(request)
+        if request.url.path in ("/", "/index.html", "/app.js", "/style.css"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True),
               name="static")
     return app

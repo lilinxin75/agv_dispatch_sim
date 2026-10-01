@@ -60,6 +60,7 @@ class Engine:
         self._plan_fail_tick: dict[int, int] = {}
         self._charge_try_tick: dict[int, int] = {}  # 充电尝试冷却（30 tick）
         self._charge_retry_tick: dict[int, int] = {}
+        self._wrong_claim_since: dict[int, int] = {}  # 非在途/在充挂名桩起始 tick（T051 泄漏治理②）
         self._park_try_tick: dict[int, int] = {}
         self._parked_ok: set[Cell] = set()  # 已靠边停好的车所在格
         self._delta: dict = {"tick": 0, "vehicles": [], "totes": [], "metrics": {}}
@@ -700,19 +701,44 @@ class Engine:
                    if v.state is VehicleState.TO_CHARGE)
 
     def _release_stale_charge_claims(self, changed_v: set[int]):
-        """桩认领泄漏治理（D14，tick-9600 解剖）。
+        """桩认领泄漏治理（D14，tick-9600 解剖；T051 倒车入位扩展）。
 
-        TO_CHARGE 旅行者认领桩后因走廊拥塞滞留超阈值（无位移）→ 释放认领、
-        清目标/路径回 IDLE 并重新入队。否则：旅行者堵在半路、桩被认领泄漏
-        （实测 10 桩 5 桩被非充电车挂名）、队列无可服务桩，系统整体卡死。
-        排队格等待（charge_target 为排队格）不受影响——那是合法波尾等待。
+        两类泄漏：
+        ① TO_CHARGE 旅行者认领桩后因走廊拥塞滞留超阈值（无位移）→ 释放认领、
+           清目标/路径回 IDLE 并重新入队。
+        ② 挂名桩但状态既非在途（TO_CHARGE）也非在充（CHARGING）——让路 WAITING、
+           异常自愈残留等——持续超宽限（60 tick）→ 释放。倒车入位后充电行程
+           变长（北上绕行入桩），让路/堵塞概率上升：快验证实测 10 桩全被非在充
+           状态车挂名（让路车 card 73/80 滞留半路），队列无可服务桩整体饿死。
+        豁免：在桩格上等功率额度的车（WAITING at pile，cell==charge_target）
+        持有认领合法；排队格等待（charge_target 为排队格）不进本函数视野——
+        那是合法波尾等待。
         """
         for v in self.vehicles.values():
-            if (v.state is VehicleState.TO_CHARGE
-                    and v.charge_target in self.grid.charging.pile_owner
-                    and v.id not in self.grid.charging.queue
-                    and self.tick_n - v.last_move_tick
-                    > cfg.CHARGE_CLAIM_STALL_TICKS):
+            tgt = v.charge_target
+            if (tgt not in self.grid.charging.pile_owner
+                    or self.grid.charging.pile_owner.get(tgt) != v.id):
+                self._wrong_claim_since.pop(v.id, None)
+                continue
+            if v.state is VehicleState.CHARGING or v.cell == tgt:
+                self._wrong_claim_since.pop(v.id, None)
+                continue
+            if v.state is VehicleState.TO_CHARGE:
+                self._wrong_claim_since.pop(v.id, None)
+                if (v.id not in self.grid.charging.queue
+                        and self.tick_n - v.last_move_tick
+                        > cfg.CHARGE_CLAIM_STALL_TICKS):
+                    self._release_pile_claim(v)
+                    v.charge_target = None
+                    v.path = []
+                    v.state = VehicleState.IDLE
+                    v.prev_state = None
+                    self.charging.enqueue(v.id, v.battery)
+                    changed_v.add(v.id)
+                continue
+            # ② 非在途/在充挂名：宽限期后释放（短时让路不抖动认领）
+            since = self._wrong_claim_since.setdefault(v.id, self.tick_n)
+            if self.tick_n - since > cfg.WRONG_STATE_CLAIM_GRACE_TICKS:
                 self._release_pile_claim(v)
                 v.charge_target = None
                 v.path = []
@@ -1447,6 +1473,7 @@ class Engine:
         self._plan_fail_tick.clear()
         self._charge_try_tick.clear()
         self._charge_retry_tick.clear()
+        self._wrong_claim_since.clear()
         self._park_try_tick.clear()
         self._parked_ok.clear()
         self.conflict_events.clear()

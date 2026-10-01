@@ -107,6 +107,9 @@ CHARGE_TRIP_CAP = int(_env("CHARGE_TRIP_CAP", 8, int))
 # 桩认领滞留释放阈值：TO_CHARGE 认领桩后超过该 tick 数无位移 → 释放认领回
 # 队列（防"旅行者堵在半路、桩被认领泄漏、队列无可服务桩"的占用泄漏）
 CHARGE_CLAIM_STALL_TICKS = int(_env("CHARGE_CLAIM_STALL_TICKS", 300, int))
+# 非在途/在充状态挂名桩的宽限：让路 WAITING 等状态挂名超过该 tick 数 → 释放认领
+# （倒车入位后行程变长让路增多，防"10 桩被非在充车挂名、队列饿死"，T051）
+WRONG_STATE_CLAIM_GRACE_TICKS = int(_env("WRONG_STATE_CLAIM_GRACE_TICKS", 60, int))
 CONFLICT_LOG_DIR = os.environ.get("RCS_CONFLICT_LOG_DIR", "logs")
 CONFLICT_OPTIMIZATION = os.environ.get("RCS_CONFLICT_OPTIMIZATION", "1") == "1"  # FR-024 热点加权
 

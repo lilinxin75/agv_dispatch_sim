@@ -126,10 +126,11 @@ class Obstacle:
 class ChargingArea:
     piles: list[Cell] = field(default_factory=list)          # 充电位格（N=10）
     pile_owner: dict[Cell, Optional[int]] = field(default_factory=dict)  # cell -> vehicle_id?
-    entry_lane: list[Cell] = field(default_factory=list)     # 进站单向通道格序列
-    exit_lane: list[Cell] = field(default_factory=list)      # 出站单向通道格序列
+    entry_lane: list[Cell] = field(default_factory=list)     # 充电区西侧内部通道（倒车入位后为排队区标注）
+    exit_lane: list[Cell] = field(default_factory=list)      # 充电区东侧内部通道（倒车入位后为普通通道）
     queue: list[int] = field(default_factory=list)           # 排队 vehicle_id（电量更低者优先出队）
     queue_cells: list[Cell] = field(default_factory=list)    # 排队格（不占主干道）
+    approach_row: int = 0                                    # 上方进桩通道行（倒车入位，D15）
 
 
 class ConflictEvent:

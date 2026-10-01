@@ -142,38 +142,43 @@ class Grid:
             exit_cols = list(range(x0, x1 + 1))
         else:
             exit_cols = list(range(c1 - 2, c1 + 1))
-        # 通道行：进站段（charge_in）+ 中段 aisle（floor）+ 出站段（charge_out）
+        # 通道行（倒车入位修订后不再承担进/出桩通行）：进站段降级为排队格、
+        # 中段/出站段为普通双向通道（research.md D15）
         for c in range(c0 + 1, c1):
-            k = CellKind.FLOOR
-            if c in entry_cols:
-                k = CellKind.CHARGE_IN
-            elif c in exit_cols:
-                k = CellKind.CHARGE_OUT
+            k = CellKind.CHARGE_QUEUE if c in entry_cols else CellKind.FLOOR
             self.kind[(lane_row, c)] = k
         # 充电位（一排，间隔 1 格），pile_row 上
         pile_cols = list(range(c0 + 5, c0 + 5 + 2 * self.pile_count, 2))
         for c in pile_cols:
             self.kind[(pile_row, c)] = CellKind.CHARGE_PILE
-            self.kind[(pile_row + 1, c)] = CellKind.CHARGE_IN  # 取车/还车连接格（保护，不可设障）
+            self.kind[(pile_row - 1, c)] = CellKind.CHARGE_IN  # 桩位上方连接格（倒车入位，保护不可设障）
             area.piles.append((pile_row, c))
             area.pile_owner[(pile_row, c)] = None
+        # 上方进桩通道（倒车入位，D15）：桩位上二排，正对各桩普通双向通道
+        area.approach_row = pile_row - 2
+        for c in range(c0 + 1, c1):
+            if self.kind.get((area.approach_row, c)) is None:
+                self.kind[(area.approach_row, c)] = CellKind.FLOOR
         # 排队格：进站段以西同排（不占主干道，FR-026）
         for c in range(c0 - 3, c0 + 1):
             self.kind[(lane_row, c)] = CellKind.CHARGE_QUEUE
             area.queue_cells.append((lane_row, c))
-        area.queue_cells.reverse()  # 距进站口近的在前
-        # 进站/出站通道格序列（车级路径用）
+        area.queue_cells.reverse()  # 距通道口近的在前
+        # 进站段降级排队格（FR-008 倒车入位修订）：并入排队序列（西端优先）
+        area.queue_cells.extend((lane_row, c) for c in entry_cols)
+        # 进站/出站段序列（仅作充电区内部标注/渲染用，不再承担进桩通行）
         area.entry_lane = [(lane_row, c) for c in entry_cols]
         area.exit_lane = [(lane_row, c) for c in exit_cols]
         self._build_directed(area)
         return area
 
     def _build_directed(self, area: ChargingArea):
-        """充电区矢量性覆盖层（002 T005 / FR-008，research.md D3）。
+        """充电区矢量性覆盖层（002 T049 / FR-008 倒车入位，research.md D15）。
 
-        - 桩格：不可穿越；仅可作充电目标，且只能自南向北（经连接格）进入
-        - 连接格（桩正下方）：仅允许 N/S（进桩/离桩）
-        - 通道行（含排队/进站/中段/出站）：仅允许 E（西→东单向）与 N（上连接格）
+        - 桩格：不可穿越；仅可作充电目标，且只能自北向南（经上方连接格）进入
+        - 连接格（桩正上方）：仅允许 N/S（进桩/倒出）
+        - 上方进桩通道（桩上二排）与通道行（排队/中段/出站段）：普通双向通道，
+          不注册方向（倒车入位后通道行不承担进桩通行）
         - 包围盒内其余格：禁止穿行（no_transit），杜绝绕行旁路
         """
         self.pile_cells: set[Cell] = set(area.piles)
@@ -181,17 +186,20 @@ class Grid:
         self.no_transit: set[Cell] = set()
         lane_row, pile_row = area.lane_row, area.pile_row
         c0, c1 = self.charge_cols
-        conn_row = pile_row + 1
-        for r in range(self.charge_rows[0] - 2, self.charge_rows[1] + 1):
+        conn_row = pile_row - 1
+        approach_row = pile_row - 2
+        # 北侧 fence 自充电区首行起（不再向上扩 2 行）：上方进桩通道与主货流
+        # 通道直接连通，车辆可自任意北部位置直入（倒车入位的关键，D15）
+        for r in range(self.charge_rows[0], self.charge_rows[1] + 1):
             for c in range(c0 - 3, c1 + 1):
                 cell = (r, c)
                 k = self.kind.get(cell)
                 if cell in self.pile_cells:
-                    self.directed[cell] = frozenset({"S"})  # 离桩只能向南
+                    self.directed[cell] = frozenset({"N"})  # 离桩只能向北（原路倒出）
                 elif r == conn_row and k == CellKind.CHARGE_IN:
-                    self.directed[cell] = frozenset({"N", "S"})
-                elif r == lane_row:
-                    self.directed[cell] = frozenset({"E", "N"})  # N 仅可上连接格
+                    self.directed[cell] = frozenset({"N", "S"})  # 进桩（S）/倒出（N）
+                elif r in (approach_row, lane_row):
+                    pass  # 双向通道：不注册方向也不禁行
                 elif k is not None:  # 包围盒内其余已标注格 → 禁止穿行
                     self.no_transit.add(cell)
                 # kind 为 None（包围盒内未标注 floor）同样禁行
@@ -224,14 +232,14 @@ class Grid:
     def can_traverse(self, frm: Cell, to: Cell, to_is_goal: bool = False) -> bool:
         """车辆从 frm 移动到 to 是否符合矢量性约束（planner/仲裁同源校验）。"""
         if to in self.pile_cells:
-            # 桩格：仅作充电目标，且只能自南向北经连接格进入
-            return to_is_goal and frm == (to[0] + 1, to[1])
+            # 桩格：仅作充电目标，且只能自北向南经上方连接格进入（倒车入位）
+            return to_is_goal and frm == (to[0] - 1, to[1])
         if to in self.no_transit:
             return False  # 永不驶入禁行格（杜绝绕行旁路）
         allowed = self.directed.get(frm)
         if allowed is not None:
-            if frm in self.pile_cells:  # 离桩：仅向南到连接格
-                return to == (frm[0] + 1, frm[1])
+            if frm in self.pile_cells:  # 离桩：仅向北到连接格（原路倒出）
+                return to == (frm[0] - 1, frm[1])
             dr, dc = to[0] - frm[0], to[1] - frm[1]
             d = {(0, 1): "E", (0, -1): "W", (1, 0): "S", (-1, 0): "N"}.get((dr, dc))
             return d is not None and d in allowed

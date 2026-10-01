@@ -42,13 +42,13 @@ PENDING（记 REASSIGNED 事件后重新入队，台账 reassigned 计数 +1，�
 | defer_charge | bool | 错峰延迟标记；被派任务即清除（D7） |
 | state | enum | 001 五态 + 充电子态不变；受阻=STALLED |
 
-### ChargingPile / ChargingArea（扩展：矢量性，FR-008）
+### ChargingPile / ChargingArea（扩展：矢量性，FR-008，2026-10-01 修订为倒车入位）
 
 | 字段 | 约束 |
 |------|------|
 | cell | 桩格；对非目标路径视为墙（不可穿越） |
-| entry_side / exit_side | 进/出方向白名单（基线：西进东出）；进入只允许 entry 侧朝向 |
-| area.entry_lane / exit_lane | 既有几何；升级为有向边强制（D3） |
+| connector_north | 桩位**上方**连接格（`pile_row-1`），N/S 双向：进入=自北向南驶入，离开=原路向北倒出（D15）；进出仅能经由该格 |
+| area.queue_cells | 西侧进站通道降级为排队等待格（D13/D14 排队治理不变）；东出通道降级为普通通道 |
 | queue | 深度 ≤ CHARGE_QUEUE_SOFT_LIMIT 时非紧急车 defer（D7） |
 | power_budget | 同时充电桩数 ≤ CHARGE_PILES；总功率 = 在充数 × rate ≤ 预算（D2/FR-008） |
 
@@ -79,6 +79,10 @@ PENDING（记 REASSIGNED 事件后重新入队，台账 reassigned 计数 +1，�
 }
 ```
 
+> **2026-10-01 修订**：`entry_cols`/`exit_cols` 语义降级——倒车入位后进/出桩走
+> 桩位上方通道，`entry_cols` 仅划定排队等待格范围，`exit_cols` 段视为普通通道；
+> 预设 JSON 字段名保持兼容，不迁移。
+
 预设：`baseline`（=001 现状） / `wide-oneway`（主干道加宽 + 局部单向段） /
 `charge-expanded`（桩 16 + 南移蓄车区 + 显式待命区）。`--layout` 选择，重启生效。
 
@@ -103,6 +107,7 @@ charge_deferred / rerouted`——事件面板据此展示"治理动作记录"（
 1. 台账恒等式（SC-002）：每 tick 引擎自检 + 测试断言
 2. tote.claimed_by 与 Task.assigned_vehicle 一一对应；改派原子交换
 3. 电量非负；充电干预先于归零（SC-006）
-4. 有向边约束：规划与执行同源（D3）；桩格非目标不可穿越
+4. 有向边约束：规划与执行同源（D3/D15）；桩格非目标不可穿越；进出仅经北侧
+   连接格（倒车入位，2026-10-01）
 5. 布局自检（--check）：全图可达 + 矢量性成立 + 待命容量充足 + 配置矛盾组合拒绝
    （如 CHARGE_SECONDS=0、SPEED_RATIO≤0）

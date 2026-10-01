@@ -30,6 +30,7 @@ let paused = false;
 let showTrails = true;          // 轨迹开关（FR-032，默认开启）
 let showGoals = false;          // 目标连线开关（FR-021，默认隐藏）
 let showHeat = false;           // 拥塞热力图开关（FR-020，默认关闭）
+let heatMode = "realtime";      // 热力图模式（FR-020 双模式拍板）：realtime=实时衰减 | cumulative=累计分析
 let trailTtl = 30;              // 轨迹消失时长（tick，FR-025；读 /api/config）
 const heat = new Map();         // "r,c" -> 热度值（拥塞热力，帧衰减）
 
@@ -37,7 +38,8 @@ const heat = new Map();         // "r,c" -> 热度值（拥塞热力，帧衰减
 function stateColor(st) {
   if (st === "to_pickup" || st === "to_dropoff") return "#3b82f6"; // 执行任务=蓝
   if (st === "waiting") return "#f59e0b";                          // 等待=橙
-  if (st === "to_charge" || st === "charging") return "#10b981";   // 充电=绿
+  if (st === "to_charge") return "#06b6d4";                        // 前往充电=青（FR-018 子态区分）
+  if (st === "charging") return "#10b981";                          // 充电中=绿（独占）
   if (st === "stalled") return "#ef4444";                          // 受阻=红
   return "#9ca3af";                                                // 空闲/让路=灰
 }
@@ -124,8 +126,8 @@ window.addEventListener("resize", resize);
 // ---- 渲染循环 ----
 let lastFrame = performance.now();
 function frame(now) {
-  // 热度帧衰减（FR-020）：历史占用热度随时间冷却
-  if (showHeat || heat.size) {
+  // 热度帧衰减（FR-020）：仅实时模式冷却；累计模式只增不减（复位/重启清零）
+  if (heatMode === "realtime" && (showHeat || heat.size)) {
     for (const [k, val] of heat) {
       const nv = val * 0.995;
       if (nv < 0.05) heat.delete(k); else heat.set(k, nv);
@@ -165,14 +167,21 @@ function render() {
   const r0 = Math.max(0, Math.floor(wy0 / CELL) - 1), r1 = Math.min(GRID - 1, Math.ceil(wy1 / CELL) + 1);
   const c0 = Math.max(0, Math.floor(wx0 / CELL) - 1), c1 = Math.min(GRID - 1, Math.ceil(wx1 / CELL) + 1);
 
-  // 拥塞热力图层（FR-020）：历史占用热度半透明覆盖，关闭即不渲染
+  // 拥塞热力图层（FR-020）：历史占用热度半透明覆盖，关闭即不渲染。
+  // 累计模式按相对热度平方根压缩归一（拍板 2026-10-01）：线性归一会随最大值
+  // 增长把中低热度格淡出至不可见，开方后历史格持续可见、热点仍突出
   if (showHeat) {
+    let heatMax = 1;
+    if (heatMode === "cumulative") {
+      for (const val of heat.values()) if (val > heatMax) heatMax = val;
+    }
     for (const [key, val] of heat) {
       const [hr, hc] = key.split(",").map(Number);
       if (hr < r0 || hr > r1 || hc < c0 || hc > c1) continue;
-      const a = Math.min(0.45, val * 0.10);
+      const nv = heatMode === "cumulative" ? 10 * Math.sqrt(val / heatMax) : val;
+      const a = Math.min(0.45, nv * 0.10);
       if (a < 0.02) continue;
-      ctxD.fillStyle = `rgba(255,${Math.max(40, 170 - val * 26) | 0},20,${a})`;
+      ctxD.fillStyle = `rgba(255,${Math.max(40, 170 - nv * 26) | 0},20,${a})`;
       ctxD.fillRect(hc * CELL, hr * CELL, CELL, CELL);
     }
   }
@@ -561,8 +570,17 @@ document.getElementById("btn-goals").onclick = (e) => {
   e.target.textContent = showGoals ? "目标连线:开" : "目标连线:关";
 };
 document.getElementById("btn-heat").onclick = (e) => {
-  showHeat = !showHeat;
-  e.target.textContent = showHeat ? "热力图:开" : "热力图:关";
+  // 单按钮三态循环（FR-020 拍板 Session 2026-10-01）：关 → 实时 → 累计 → 关
+  if (!showHeat) {
+    showHeat = true;
+    heatMode = "realtime";
+  } else if (heatMode === "realtime") {
+    heatMode = "cumulative";
+  } else {
+    showHeat = false;
+  }
+  e.target.textContent = !showHeat ? "热力图:关"
+    : heatMode === "realtime" ? "热力图:实时(约10秒消退)" : "热力图:累计(不消失)";
 };
 
 // ---- 指标趋势图（FR-023）：metrics_history 驱动，可切吞吐/平均周期 ----

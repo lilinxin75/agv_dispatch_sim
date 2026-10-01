@@ -7,8 +7,8 @@ description: "Task list for 002-constraints-layout-polish implementation"
 **Input**: Design documents from `/specs/002-constraints-layout-polish/`
 
 **Prerequisites**: plan.md (required), spec.md (required for user stories),
-research.md (D1–D10 决策), data-model.md (实体扩展), contracts/api-delta.md (增量契约),
-quickstart.md (验证场景)
+research.md (D1–D15 决策，D15/D10 为 2026-10-01 修订), data-model.md (实体扩展),
+contracts/api-delta.md (增量契约), quickstart.md (验证场景)
 
 **Tests**: SC-007 明确要求新增约束（台账恒等式/改派/背压/硬件速度模型/矢量性/布局预设）
 均有测试断言 → 每个 US 先写失败测试再实现（TDD）。
@@ -291,7 +291,81 @@ baseline 与 wide-oneway 同种子 10 分钟指标差异可量化
 
 ---
 
+## Phase 9: 2026-10-01 修订增量 — FR-008 倒车入位 / FR-018 子态颜色 / FR-020 热力图双模式
+
+**Purpose**: 落地 spec Session 2026-10-01 三条拍板（research.md D15 + D10 修订）。
+T001–T045 已完成的历史任务不动；本 Phase 增量执行。
+
+**Independent Test**: quickstart ④ 人工核验第 1/3/9 项逐项通过；pytest 矢量性
+用例（倒车入位口径）全绿；8000 tick 快验证 FR-027 零异常
+
+### Implementation
+
+- [X] T046 [P] [US5] `rcs_demo/static/app.js` `stateColor()`：`to_charge` 改用
+      冷色青 `#06b6d4`，`charging` 独占绿色 `#10b981`（FR-018 拍板：两子态颜色
+      可区分）；⚡ 角标逻辑不变（仅 charging 显示）；详情卡片/事件面板文案不变
+- [X] T047 [P] [US5] `rcs_demo/static/app.js` + `index.html`：热力图双模式
+      （FR-020 拍板）——新增 `heatMode`（"realtime" | "cumulative"，默认
+      realtime）：实时模式保持既有 ×0.995 帧衰减、<0.05 删除（约 10 秒淡出）；
+      累计模式跳过衰减、只增不减，着色按当前热度最大值归一（供布局对比分析）；
+      工栏热力图按钮旁新增模式切换按钮；复位/重启清零两模式共用（`heat.clear()`
+      既有路径）；图层关闭仍立即隐藏且零渲染成本
+- [X] T048 [US2] `tests/test_constraints.py` 矢量性用例改为倒车入位口径（先改，
+      确认对 T049 实现为 FAIL）：① 桩格对非目标路径不可穿越（不变）；② 以桩格为
+      目标仅可从桩位上方经北侧连接格向南进入；③ 离开桩格仅能向北经连接格倒出；
+      ④ 连接格 E/W 方向不可通行；⑤ baseline + wide-oneway + charge-expanded
+      三预设全部通过
+- [X] T049 [US2] `rcs_demo/sim/grid.py` `_build_charging` / `_build_directed`
+      实现倒车入位（research.md D15 / FR-008 拍板）：① 连接格由 `pile_row+1`
+      移至 `pile_row-1`（桩位上方），注册方向白名单 {N,S}；② 桩格进入仅允许
+      自北向南（经连接格），离开仅允许自南向北（原路倒出）；③ 桩格对非目标
+      路径仍视为墙（不可穿越不变）；④ 西侧进站段（entry_cols 范围）降级为
+      CHARGE_QUEUE 排队格，不再注册进桩方向；⑤ 东出段（exit_cols 范围）降级为
+      普通通道，不再注册出桩方向；⑥ `can_traverse` 语义同步更新
+- [X] T050 [US2] `rcs_demo/__main__.py` `--check` 矢量性校验改为倒车入位口径：
+      北口进出成立 + 桩格不可穿越 + 连接格 N/S 双向 + 全图可达性含"上方进桩
+      通道可达每个桩位"；`rcs_demo/layouts/*.json` 不改字段名（entry_cols/
+      exit_cols 语义按 data-model.md 修订注记降级，保持兼容）
+- [X] T051 [US2] 回归核查：确认 `engine.py` `_arrive_charge`（cell==pile 判定）、
+      `_charge_queue_scheduling` 与 D13/D14 治理逻辑（认领释放/TRIP_CAP/排队
+      预算）在倒车入位下无需改动且行为正确；T048 测试转绿 + 既有全部用例
+      无回归；容器内 8000 tick 快验证冒烟
+      （`python3 -m rcs_demo.acceptance --ticks 8000`）FR-027 零异常中止
+- [X] T052 [US3] quickstart ④ 人工核验第 1 项（前往充电=青/充电中=绿）、第 3 项
+      （热力图实时/累计双模式）、第 9 项（低电车从桩位上方直入、充满原路向北
+      倒出）逐项通过；在本 Phase 末尾记录验证结果备注
+
+**Checkpoint**: 2026-10-01 三拍板全部落地；全量测试绿；快验证零异常
+
+**执行记录（2026-10-01）**：
+- T048 先行确认 6/6 FAIL → T049/T050 实现后 56/56 全绿（含修正 planner.py
+  内联进桩规则同源拷贝、旧口径用例 test_dock_path_exists_for_every_pile /
+  test_preset_reachable_and_vector_valid / 障碍校验用例、no_bypass 豁免双向通道行）
+- T051 快验证两轮解剖：①首轮中止——包围盒北侧 fence（charge_rows[0]-2 起）
+  挡死上方进桩通道 → fence 下移至 charge_rows[0]，主货流直连进桩通道；
+  ②二轮中止（seed 42）——10 桩被让路/滞留的 WAITING 状态车挂名（D14 释放
+  治理仅覆盖 TO_CHARGE）→ 新增泄漏治理②：非在途/在充挂名超 60 tick 释放
+  （WRONG_STATE_CLAIM_GRACE_TICKS，在桩等功率额度豁免；reset 同步清计时器）。
+  治理后 8400 tick 全程跑通：零碰撞、FR-027 零异常、done 548、滞零 3–8 台
+  波动、sc001_ratio 0.732
+- 同 seed 42 对照实验（旧西进东出几何）：done 519 / sc001 0.857 / wall 194s
+  vs 新几何 done 548 / 0.732 / 48s——整体吞吐与尾部吞吐（41 vs 37.7/窗）均优，
+  比率偏低仅因直入使前期峰值抬高（56 vs 44）摊薄分母，非回退
+- T052：第 9 项（倒车入位行为）由测试+快验证自动化证明 ✓；第 1/3 项代码与
+  静态资源服务确认（/app.js 含 #06b6d4、/index.html 含 btn-heat-mode）✓，
+  浏览器视觉核验待人工确认
+
+---
+
 ## Dependencies & Execution Order
+
+### Phase 9 追加依赖（2026-10-01）
+
+- 依赖 Phase 1–8 全部完成（T001–T045 已勾选）
+- T046 ∥ T047（同为 app.js/index.html 前端小改，无相互依赖；建议串行合并避免
+  同文件冲突）
+- T048（测试先行）→ T049（grid.py 实现）→ T050（--check 口径）→ T051（回归
+  核查 + 快验证）→ T052（人工核验），严格顺序——T049/T050/T051 同源改动链
 
 ### Phase Dependencies
 

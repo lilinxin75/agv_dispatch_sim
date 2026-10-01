@@ -13,7 +13,7 @@ from rcs_demo.sim.planner import Planner
 from tests.test_simulation import run  # noqa: F401  # 复用 tick 循环辅助
 
 
-# ---- 充电桩矢量性（FR-008 / T008）----
+# ---- 充电桩矢量性（FR-008 倒车入位 / T048，research.md D15）----
 
 def make_planner(docked=()):
     g = Grid()
@@ -33,57 +33,80 @@ def test_pile_not_usable_as_transit():
     path = p.plan(west, east, "E", False, set())
     assert path is not None  # 绕行存在
     assert pile not in path, "路径穿越了充电桩格"
-    # 桩格四邻直接进入桩格（非合法入桩方式）一律被拒
-    for n in ((pile[0] + 1, pile[1] - 1), (pile[0] - 1, pile[1]),
-              (pile[0], pile[1] - 1), (pile[0], pile[1] + 1)):
+    # 北连接格之外的邻居直接进入桩格（非合法入桩方式）一律被拒
+    for n in ((pile[0] + 1, pile[1]), (pile[0], pile[1] - 1),
+              (pile[0], pile[1] + 1)):
         assert not g.can_traverse(n, pile, to_is_goal=True)
 
 
-def test_pile_entry_only_from_south_when_goal():
-    """桩格作为目标时只能自南向北（经连接格）进入。"""
+def test_pile_entry_only_from_north_when_goal():
+    """桩格作为目标时只能自北向南（经上方连接格）进入（倒车入位）。"""
     g, _ = make_planner()
     pile = g.charging.piles[0]
-    conn = (pile[0] + 1, pile[1])
+    conn = (pile[0] - 1, pile[1])
     assert g.kind[conn] == CellKind.CHARGE_IN
     assert g.can_traverse(conn, pile, to_is_goal=True)
     assert not g.can_traverse((pile[0], pile[1] - 1), pile, to_is_goal=True)
     assert not g.can_traverse((pile[0], pile[1] + 1), pile, to_is_goal=True)
-    assert not g.can_traverse((pile[0] - 1, pile[1]), pile, to_is_goal=True)
+    assert not g.can_traverse((pile[0] + 1, pile[1]), pile, to_is_goal=True)
 
 
-def test_pile_exit_only_south():
-    """离桩只能向南（西进东出矢量性的一部分）。"""
+def test_pile_exit_only_north():
+    """离桩只能向北原路倒出（倒车入位）。"""
     g, _ = make_planner()
     pile = g.charging.piles[0]
-    conn = (pile[0] + 1, pile[1])
+    conn = (pile[0] - 1, pile[1])
     assert g.can_traverse(pile, conn)
     assert not g.can_traverse(pile, (pile[0], pile[1] + 1))
     assert not g.can_traverse(pile, (pile[0], pile[1] - 1))
+    assert not g.can_traverse(pile, (pile[0] + 1, pile[1]))
 
 
-def test_charge_lane_one_way_west_to_east():
-    """充电区通道行单向：东→西逆行路径不存在；西→东可行。"""
+def test_connector_sideways_blocked():
+    """连接格仅允许 N/S（进桩/倒出），横向 E/W 不可借道。"""
+    g, _ = make_planner()
+    pile = g.charging.piles[0]
+    conn = (pile[0] - 1, pile[1])
+    assert not g.can_traverse(conn, (conn[0], conn[1] + 1))
+    assert not g.can_traverse(conn, (conn[0], conn[1] - 1))
+    assert g.can_traverse(conn, (conn[0] - 1, conn[1]))  # 向北倒出
+
+
+def test_direct_dock_from_above():
+    """倒车入位：上方通道正对桩位可直接入桩（无需绕行西侧进站通道）。"""
     g, p = make_planner()
-    lane_row = g.charging.lane_row
-    c0, c1 = g.charge_cols
-    west = (lane_row, c0 - 4)
-    east = (lane_row, c1 + 2)
-    assert p.plan(west, east, "E", False, set()) is not None, "西→东进站方向应可达"
-    for c in range(c0 - 2, c1):
-        assert not g.can_traverse((lane_row, c), (lane_row, c - 1)), \
-            f"通道行 ({lane_row},{c}) 向西逆行未被拒"
+    pile = g.charging.piles[4]  # 中部桩位
+    above = (pile[0] - 2, pile[1])  # 上方进桩通道，正对桩位
+    path = p.plan(above, pile, "S", False, set())
+    assert path is not None, "上方直入路径应存在"
+    assert path[-1] == pile and len(path) == 2, f"应为一格连接格直入: {path}"
+
+
+def test_reverse_docking_all_presets():
+    """倒车入位矢量性在全部布局预设下成立（FR-014）。"""
+    for name in ("baseline", "wide-oneway", "charge-expanded"):
+        g = Grid(load_profile(name))
+        for pile in (g.charging.piles[0], g.charging.piles[-1]):
+            conn = (pile[0] - 1, pile[1])
+            assert g.kind[conn] == CellKind.CHARGE_IN, f"{name}: 连接格缺失"
+            assert g.can_traverse(conn, pile, to_is_goal=True), \
+                f"{name}: 北连接格入桩应可行"
+            assert g.can_traverse(pile, conn), f"{name}: 向北倒出应可行"
+            assert not g.can_traverse((pile[0] + 1, pile[1]), pile, to_is_goal=True), \
+                f"{name}: 南侧入桩必须被拒"
 
 
 def test_charging_interior_no_bypass():
-    """充电区包围盒内非通道格不可作为穿行旁路。"""
+    """充电区包围盒内非通道格不可作为穿行旁路（双向通道行豁免，倒车入位）。"""
     g, _ = make_planner()
     r0, r1 = g.charge_rows
     c0, c1 = g.charge_cols
     lane_row = g.charging.lane_row
-    for r in range(r0 - 2, r1 + 1):
+    approach_row = g.charging.approach_row
+    for r in range(r0, r1 + 1):  # 北侧 fence 自充电区首行起（倒车入位，D15）
         for c in range(c0 - 3, c1 + 1):
             cell = (r, c)
-            if cell in g.pile_cells or cell in g.directed:
+            if cell in g.pile_cells or cell in g.directed or r in (approach_row, lane_row):
                 continue
             assert cell in g.no_transit, f"({r},{c}) 未注册为禁行格"
     sample = next(iter(g.no_transit))
@@ -92,10 +115,10 @@ def test_charging_interior_no_bypass():
 
 
 def test_dock_path_exists_for_every_pile():
-    """每个桩位均存在到桩的合法路径（自连接格进入）。"""
+    """每个桩位均存在到桩的合法路径（自上方连接格进入，倒车入位）。"""
     g, p = make_planner()
     for pile in g.charging.piles:
-        conn = (pile[0] + 1, pile[1])
+        conn = (pile[0] - 1, pile[1])
         path = p.plan_any_dir(conn, pile, False, set())
         assert path is not None, f"桩 {pile} 不可达"
         assert path[-1] == pile
@@ -120,12 +143,14 @@ def test_preset_reachable_and_vector_valid(name):
     g = Grid(profile)
     p = Planner(g, lambda c: False)
     for pile in g.charging.piles:
-        conn = (pile[0] + 1, pile[1])
+        conn = (pile[0] - 1, pile[1])
         assert p.plan_any_dir(conn, pile, False, set()) is not None
-    lane_row = g.charging.lane_row
-    c0, c1 = g.charge_cols
-    for c in range(c0 - 2, c1):
-        assert not g.can_traverse((lane_row, c), (lane_row, c - 1))
+    # 倒车入位（FR-008 修订）：北连接格入桩、向北倒出、南侧入桩被拒
+    for pile in (g.charging.piles[0], g.charging.piles[-1]):
+        conn = (pile[0] - 1, pile[1])
+        assert g.can_traverse(conn, pile, to_is_goal=True)
+        assert g.can_traverse(pile, conn)
+        assert not g.can_traverse((pile[0] + 1, pile[1]), pile, to_is_goal=True)
 
 
 def test_preset_unknown_name_rejected():

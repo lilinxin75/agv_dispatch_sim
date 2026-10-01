@@ -64,9 +64,9 @@ def test_obstacle_validation():
     inbound = g.inbound_cells[0]
     ok, _ = g.can_add_obstacle(inbound, occupant=None, docked_tote=False)
     assert not ok
-    # 充电区格（pile/entry/exit/queue）拒绝
-    for c in (g.charging.piles[0], g.charging.entry_lane[0],
-              g.charging.exit_lane[0], g.charging.queue_cells[0]):
+    # 充电区格（pile/上方连接格/queue）拒绝；entry/exit 段已降级为普通通道可设障
+    pile0 = g.charging.piles[0]
+    for c in (pile0, (pile0[0] - 1, pile0[1]), g.charging.queue_cells[0]):
         ok, _ = g.can_add_obstacle(c, occupant=None, docked_tote=False)
         assert not ok
 
