@@ -1,6 +1,6 @@
 """SC-008/009 基准对比：热点优化开/关下的互堵频次与时长（FR-024 验收）。
 
-用法：python -m rcs_demo.bench_conflicts [--ticks N] [--seed N]
+用法：python -m agv_dispatch_sim.bench_conflicts [--ticks N] [--seed N]
 缩尺快速对比（与全量共享引擎代码）；结果打印为对比表。
 """
 from __future__ import annotations

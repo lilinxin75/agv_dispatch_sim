@@ -1,5 +1,5 @@
 """启动自检（章程 V / quickstart.md / T010）。"""
-import rcs_demo.__main__ as main_mod
+import agv_dispatch_sim.__main__ as main_mod
 
 
 def test_check_selftest_passes(capsys):

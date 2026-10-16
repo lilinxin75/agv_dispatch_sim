@@ -12,7 +12,7 @@ import json
 import os
 from datetime import datetime
 
-from rcs_demo.sim import entities as E
+from agv_dispatch_sim.sim import entities as E
 
 
 def find_mutual_blocks(edges: dict[int, int]) -> set[int]:

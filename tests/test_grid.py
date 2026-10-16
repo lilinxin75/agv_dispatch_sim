@@ -1,7 +1,7 @@
 """布局约束与障碍物校验（T007 / T036）。"""
-from rcs_demo import config as cfg
-from rcs_demo.sim.entities import CellKind
-from rcs_demo.sim.grid import Grid
+from agv_dispatch_sim import config as cfg
+from agv_dispatch_sim.sim.entities import CellKind
+from agv_dispatch_sim.sim.grid import Grid
 
 
 def test_grid_dimensions_and_boundary():

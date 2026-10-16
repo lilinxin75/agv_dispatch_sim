@@ -2,8 +2,8 @@
 
 用法（容器内）::
 
-    python3 -m rcs_demo.acceptance --ticks 36000 --seed 42
-    python3 -m rcs_demo.acceptance --ticks 8000          # 快速冒烟
+    python3 -m agv_dispatch_sim.acceptance --ticks 36000 --seed 42
+    python3 -m agv_dispatch_sim.acceptance --ticks 8000          # 快速冒烟
 
 逐窗口落盘监控指标到 ``<report-dir>/marks.jsonl``；命中任一异常判据立即中止
 （exit code 2）并输出诊断；正常跑完输出验收摘要（SC-001 双口径等）并 exit 0。

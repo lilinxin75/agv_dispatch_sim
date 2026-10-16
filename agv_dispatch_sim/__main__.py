@@ -1,4 +1,4 @@
-"""入口：python -m rcs_demo [--check] [--layout NAME] [--port N] [--seed N] [--fast]。
+"""入口：python -m agv_dispatch_sim [--check] [--layout NAME] [--port N] [--seed N] [--fast]。
 
 --check 自检（章程 V / quickstart.md）：配置矛盾校验、布局生成（含矢量性）、
 A* 可达性抽检、预约表互斥自测、API 端口可绑定。
@@ -99,11 +99,11 @@ def _check(port: int, layout: str | None) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="rcs_demo",
-                                 description="RCS 多车料箱搬运调度演示")
+    ap = argparse.ArgumentParser(prog="agv_dispatch_sim",
+                                 description="AGV 多车料箱搬运调度仿真")
     ap.add_argument("--check", action="store_true", help="启动自检后退出")
     ap.add_argument("--layout", default=None,
-                    help="布局预设（默认取 RCS_LAYOUT，再默认 baseline）；"
+                    help="布局预设（默认取 AGV_LAYOUT，再默认 baseline）；"
                          "与 --check 连用时缺省校验全部预设")
     ap.add_argument("--port", type=int, default=8000, help="HTTP 端口（默认 8000）")
     ap.add_argument("--host", default="0.0.0.0", help="监听地址")
@@ -133,7 +133,7 @@ def main() -> int:
     layout = load_profile(name) if name != "baseline" else None
     engine = Engine(seed=args.seed, layout=layout)
     app = create_app(engine, fast=args.fast)
-    print(f"RCS demo serving on http://{args.host}:{args.port} "
+    print(f"agv-dispatch-sim serving on http://{args.host}:{args.port} "
           f"(layout={name}; Ctrl+C 停止；浏览器打开 http://localhost:{args.port})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     engine.close()

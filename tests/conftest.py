@@ -7,9 +7,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import rcs_demo.config as cfg  # noqa: E402
-import rcs_demo.sim.engine as engine_mod  # noqa: E402
-from rcs_demo.sim.engine import Engine  # noqa: E402
+import agv_dispatch_sim.config as cfg  # noqa: E402
+import agv_dispatch_sim.sim.engine as engine_mod  # noqa: E402
+from agv_dispatch_sim.sim.engine import Engine  # noqa: E402
 
 
 @pytest.fixture

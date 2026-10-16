@@ -1,4 +1,4 @@
-"""可调参数配置（全量参数支持 RCS_* 环境变量覆盖）。
+"""可调参数配置（全量参数支持 AGV_* 环境变量覆盖）。
 
 布局常量依据 data-model.md「布局与电量常量」与 research.md R6/R10。
 002 期增量（specs/002-constraints-layout-polish）：硬件速度/能耗模型、治理开关、
@@ -14,16 +14,16 @@ LAYOUTS_DIR = Path(__file__).resolve().parent / "layouts"
 
 
 def _env(name: str, default: float, cast=float):
-    v = os.environ.get(f"RCS_{name}")
+    v = os.environ.get(f"AGV_{name}")
     return default if v is None else cast(v)
 
 
 def _env_str(name: str, default: str):
-    return os.environ.get(f"RCS_{name}", default)
+    return os.environ.get(f"AGV_{name}", default)
 
 
 def _env_bool(name: str, default: bool):
-    v = os.environ.get(f"RCS_{name}")
+    v = os.environ.get(f"AGV_{name}")
     return default if v is None else v == "1"
 
 
@@ -110,8 +110,8 @@ CHARGE_CLAIM_STALL_TICKS = int(_env("CHARGE_CLAIM_STALL_TICKS", 300, int))
 # 非在途/在充状态挂名桩的宽限：让路 WAITING 等状态挂名超过该 tick 数 → 释放认领
 # （倒车入位后行程变长让路增多，防"10 桩被非在充车挂名、队列饿死"，T051）
 WRONG_STATE_CLAIM_GRACE_TICKS = int(_env("WRONG_STATE_CLAIM_GRACE_TICKS", 60, int))
-CONFLICT_LOG_DIR = os.environ.get("RCS_CONFLICT_LOG_DIR", "logs")
-CONFLICT_OPTIMIZATION = os.environ.get("RCS_CONFLICT_OPTIMIZATION", "1") == "1"  # FR-024 热点加权
+CONFLICT_LOG_DIR = os.environ.get("AGV_CONFLICT_LOG_DIR", "logs")
+CONFLICT_OPTIMIZATION = os.environ.get("AGV_CONFLICT_OPTIMIZATION", "1") == "1"  # FR-024 热点加权
 
 # ---- 前端视口（FR-030）----
 ZOOM_MIN = _env("ZOOM_MIN", 0.25)

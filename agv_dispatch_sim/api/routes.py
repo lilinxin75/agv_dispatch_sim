@@ -39,7 +39,7 @@ def create_app(engine: Engine, fast: bool = False) -> FastAPI:
         yield
         task.cancel()
 
-    app = FastAPI(title="RCS Multi-Vehicle Dispatch Demo", version="1.0.0",
+    app = FastAPI(title="AGV Multi-Vehicle Dispatch Simulation", version="1.0.0",
                   lifespan=lifespan)
 
     # ---- REST（契约 rest-api.md）----

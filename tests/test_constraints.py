@@ -5,10 +5,10 @@
 """
 import pytest
 
-from rcs_demo import config as cfg
-from rcs_demo.sim.entities import CellKind, TaskState, VehicleState
-from rcs_demo.sim.grid import Grid, load_profile
-from rcs_demo.sim.planner import Planner
+from agv_dispatch_sim import config as cfg
+from agv_dispatch_sim.sim.entities import CellKind, TaskState, VehicleState
+from agv_dispatch_sim.sim.grid import Grid, load_profile
+from agv_dispatch_sim.sim.planner import Planner
 
 from tests.test_simulation import run  # noqa: F401  # 复用 tick 循环辅助
 

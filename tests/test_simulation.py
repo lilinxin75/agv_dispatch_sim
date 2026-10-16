@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from rcs_demo import config as cfg
-from rcs_demo.sim.entities import VehicleState
+from agv_dispatch_sim import config as cfg
+from agv_dispatch_sim.sim.entities import VehicleState
 
 
 def run(e, ticks):

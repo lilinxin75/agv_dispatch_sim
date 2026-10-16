@@ -1,8 +1,8 @@
 """互堵冲突事件分析工具（FR-023，供开发迭代使用，非观看者功能）。
 
 用法：
-    python -m rcs_demo.analyze_conflicts logs/conflicts_20260929_120000.jsonl
-    python -m rcs_demo.analyze_conflicts logs/ --top 20
+    python -m agv_dispatch_sim.analyze_conflicts logs/conflicts_20260929_120000.jsonl
+    python -m agv_dispatch_sim.analyze_conflicts logs/ --top 20
 
 输出：热点位置 TOP-N、互堵频次（次/千 tick）、单次时长分布统计。
 """
@@ -90,7 +90,7 @@ def main() -> int:
         print(f"  涉事车辆载货比例: {r['carried_ratio']}")
         print(f"  热点位置 TOP{args.top}: {r['hotspot_cells']}")
         print(f"  高发车辆: {r['hotspot_vehicles']}")
-    print("\n提示：热点格可用于路径代价加权优化（FR-024，配置 RCS_TURN_PENALTY 等）")
+    print("\n提示：热点格可用于路径代价加权优化（FR-024，配置 AGV_TURN_PENALTY 等）")
     return 0
 
 

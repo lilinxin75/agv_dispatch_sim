@@ -1,6 +1,6 @@
 """规划器：A* 可达/绕障、预约互斥、转弯代价（T028）。"""
-from rcs_demo.sim.grid import Grid
-from rcs_demo.sim.planner import Planner, ReservationTable
+from agv_dispatch_sim.sim.grid import Grid
+from agv_dispatch_sim.sim.planner import Planner, ReservationTable
 
 
 def make_planner(docked=()):

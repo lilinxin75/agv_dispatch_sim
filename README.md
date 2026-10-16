@@ -1,4 +1,24 @@
-# RCS 多车料箱搬运调度演示 (Multi-Vehicle Grid Dispatch Demo)
+<div align="center">
+    <h1>🚗 agv-dispatch-sim</h1>
+    <h3><em>AGV 多车料箱搬运调度仿真 — 200×200 网格 · 100 台小车 · 零碰撞时空预约调度</em></h3>
+</div>
+
+<p align="center">
+    <a href="#启动3-条命令内"><img src="https://img.shields.io/badge/python-3.10+-blue" alt="Python 3.10+"/></a>
+    <a href="#自动化测试"><img src="https://img.shields.io/badge/tests-pytest-brightgreen" alt="pytest"/></a>
+    <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/framework-FastAPI-teal" alt="FastAPI"/></a>
+    <a href="#功能清单"><img src="https://img.shields.io/badge/simulation-200%C3%97200%20grid%20%C2%B7%20100%20vehicles-blueviolet" alt="200×200 grid · 100 vehicles"/></a>
+    <a href="#功能清单"><img src="https://img.shields.io/badge/collision-0-success" alt="Zero collisions"/></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-CC%20BY--NC%204.0-orange" alt="License: CC BY-NC 4.0"/></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/%E7%94%A8%E9%80%94-%E9%9D%9E%E5%95%86%E4%B8%9A-important" alt="非商业用途"/></a>
+</p>
+
+<p align="center">
+    <strong>简体中文</strong> ·
+    <a href="./README.en.md">English</a>
+</p>
+
+---
 
 仓储料箱搬运调度演示：200×200 网格地图、100 台同质小车在离散时间步进仿真中
 执行入库/出库料箱搬运任务（1:1 成对生成、循环复用），A* 路径规划（转弯软代价，
@@ -11,7 +31,7 @@
 
 ```bash
 pip install -r requirements.txt
-python -m rcs_demo            # 默认 0.0.0.0:8000，--port 改端口
+python -m agv_dispatch_sim            # 默认 0.0.0.0:8000，--port 改端口
 # 浏览器打开 http://localhost:8000
 ```
 
@@ -26,7 +46,7 @@ python -m rcs_demo            # 默认 0.0.0.0:8000，--port 改端口
 ## 启动自检
 
 ```bash
-python -m rcs_demo --check
+python -m agv_dispatch_sim --check
 ```
 
 校验固定布局生成（货架区 2400 点位/站点/充电区）、A* 可达性抽检、预约表互斥、
@@ -50,7 +70,7 @@ API 端口可绑定，输出 `OK: grid layout / planner / engine self-test passe
   自动改派、工作站容量上限、拥塞背压（等待率超阈值自动放慢任务生成节奏，缓解后恢复）
 - **视口缩放平移**：滚轮以光标为锚缩放 0.25×–4×，拖拽平移（与点击智能区分，无需切换模式），
   一键复位整图
-- **移动轨迹尾迹**：轨迹随**时间蒸发**（默认约 3 秒，`RCS_TRAIL_TTL_TICKS` 可调）——
+- **移动轨迹尾迹**：轨迹随**时间蒸发**（默认约 3 秒，`AGV_TRAIL_TTL_TICKS` 可调）——
   行走刷新、停顿渐消，而非固定长度拖尾（工具栏「轨迹」开关）；位置跳变自动断开不连线
 - **显示效果**（002）：五态着色（执行任务=蓝/等待=橙/充电=绿/空闲=灰/受阻=红）、
   车载电量条（<20% 橙、<10% 红、充电 ⚡）、拥塞热力图图层、车辆目标点直连线图层
@@ -61,35 +81,35 @@ API 端口可绑定，输出 `OK: grid layout / planner / engine self-test passe
   JSONL 落盘 `logs/conflicts_<启动时间戳>.jsonl`；分析工具输出热点位置、
   频次（次/千 tick）、时长分布：
   ```bash
-  python -m rcs_demo.analyze_conflicts logs/conflicts_XXXXXX.jsonl
+  python -m agv_dispatch_sim.analyze_conflicts logs/conflicts_XXXXXX.jsonl
   ```
 
-## 可调参数（RCS_* 环境变量覆盖，全量见 `GET /api/config`）
+## 可调参数（AGV_* 环境变量覆盖，全量见 `GET /api/config`）
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `RCS_TASKS_PER_SECOND` | 1 | 任务生成节奏（核算基准） |
-| `RCS_BATTERY_FULL` | 1000 | 满电点数（可续航格数） |
-| `RCS_LOAD_FACTOR` | 1.5 | 载货每格耗电倍率（空载 1 点/格） |
-| `RCS_BATTERY_LOW_RATIO` | 0.2 | 低电阈值（触发充电标记） |
-| `RCS_BATTERY_CRITICAL_RATIO` | 0.05 | 临界阈值（兜底直奔充电区） |
-| `RCS_CHARGE_SECONDS` | 20 | 从 20% 充到满电秒数（002 期自 30 调整：恢复充电容量余量，见 research.md D11） |
-| `RCS_CHARGE_PILES` | 10 | 充电位数量（FR-029 公式核算默认值） |
-| `RCS_CHARGE_POWER_BUDGET_RATIO` | 1.0 | 充电区供电总功率预算比例（<1 时功率受限） |
-| `RCS_LOADED_SPEED_RATIO` | 0.7 | 载货速度倍率（空载 1.0） |
-| `RCS_TURN_SPEED_RATIO` | 0.5 | 转向步速度倍率 |
-| `RCS_TURN_ENERGY` | 0.5 | 转向步额外耗电（点） |
-| `RCS_REASSIGN_TICKS` | 300 | 任务无进度改派阈值（tick） |
-| `RCS_STATION_CAPACITY` | 6 | 工作站同时在场车辆上限 |
-| `RCS_CHARGE_QUEUE_SOFT_LIMIT` | 6 | 充电排队深度软上限（超过触发错峰延迟） |
-| `RCS_CHARGE_TRIP_CAP` | 8 | 在途充电行程上限（waiting-room 限流，防充电区入口走廊堵死，research.md D14） |
-| `RCS_CHARGE_CLAIM_STALL_TICKS` | 300 | 充电位认领滞留释放阈值（旅行者滞留超时释放认领回队列，D14） |
-| `RCS_GOVERN_BACKPRESSURE` / `RCS_GOVERN_REASSIGN` / `RCS_GOVERN_CHARGE_DEFER` | 1 | 拥塞治理组合开关（背压/改派/错峰，可独立关闭对比） |
-| `RCS_TRAIL_TTL_TICKS` | 30 | 轨迹消失时长（tick，≈3 秒） |
-| `RCS_TURN_PENALTY` | 3 | 每次转向的路径代价惩罚（软约束） |
-| `RCS_ZOOM_MIN` / `RCS_ZOOM_MAX` | 0.25 / 4.0 | 前端视口缩放范围 |
-| `RCS_TICK_RATE` | 10 | 仿真 tick 频率（/秒） |
-| `RCS_STALL_TICKS` | 150 | 卡死检测阈值（tick，~15s） |
+| `AGV_TASKS_PER_SECOND` | 1 | 任务生成节奏（核算基准） |
+| `AGV_BATTERY_FULL` | 1000 | 满电点数（可续航格数） |
+| `AGV_LOAD_FACTOR` | 1.5 | 载货每格耗电倍率（空载 1 点/格） |
+| `AGV_BATTERY_LOW_RATIO` | 0.2 | 低电阈值（触发充电标记） |
+| `AGV_BATTERY_CRITICAL_RATIO` | 0.05 | 临界阈值（兜底直奔充电区） |
+| `AGV_CHARGE_SECONDS` | 20 | 从 20% 充到满电秒数（002 期自 30 调整：恢复充电容量余量，见 research.md D11） |
+| `AGV_CHARGE_PILES` | 10 | 充电位数量（FR-029 公式核算默认值） |
+| `AGV_CHARGE_POWER_BUDGET_RATIO` | 1.0 | 充电区供电总功率预算比例（<1 时功率受限） |
+| `AGV_LOADED_SPEED_RATIO` | 0.7 | 载货速度倍率（空载 1.0） |
+| `AGV_TURN_SPEED_RATIO` | 0.5 | 转向步速度倍率 |
+| `AGV_TURN_ENERGY` | 0.5 | 转向步额外耗电（点） |
+| `AGV_REASSIGN_TICKS` | 300 | 任务无进度改派阈值（tick） |
+| `AGV_STATION_CAPACITY` | 6 | 工作站同时在场车辆上限 |
+| `AGV_CHARGE_QUEUE_SOFT_LIMIT` | 6 | 充电排队深度软上限（超过触发错峰延迟） |
+| `AGV_CHARGE_TRIP_CAP` | 8 | 在途充电行程上限（waiting-room 限流，防充电区入口走廊堵死，research.md D14） |
+| `AGV_CHARGE_CLAIM_STALL_TICKS` | 300 | 充电位认领滞留释放阈值（旅行者滞留超时释放认领回队列，D14） |
+| `AGV_GOVERN_BACKPRESSURE` / `AGV_GOVERN_REASSIGN` / `AGV_GOVERN_CHARGE_DEFER` | 1 | 拥塞治理组合开关（背压/改派/错峰，可独立关闭对比） |
+| `AGV_TRAIL_TTL_TICKS` | 30 | 轨迹消失时长（tick，≈3 秒） |
+| `AGV_TURN_PENALTY` | 3 | 每次转向的路径代价惩罚（软约束） |
+| `AGV_ZOOM_MIN` / `AGV_ZOOM_MAX` | 0.25 / 4.0 | 前端视口缩放范围 |
+| `AGV_TICK_RATE` | 10 | 仿真 tick 频率（/秒） |
+| `AGV_STALL_TICKS` | 150 | 卡死检测阈值（tick，~15s） |
 
 充电位数量按 FR-029 公式联动：忙碌桩数 ≈ 任务节奏 × 单任务平均耗电 ÷ 单桩充电速率，
 上取整 + 约 30% 余量；基准参数核算结果为 10（`GET /api/config` 的
@@ -118,13 +138,13 @@ pytest tests/ -q
 
 ```bash
 docker exec -it rcs_core_dev \
-  bash -c "cd /home/dev/workspace/binglee/rcs_demo && pip install -r requirements.txt && python -m rcs_demo --check"
+  bash -c "cd /home/dev/workspace/binglee/agv-dispatch-sim && pip install -r requirements.txt && python -m agv_dispatch_sim --check"
 # 容器内启动服务后，宿主机浏览器访问 http://localhost:8000（host 网络直通）
 ```
 
 ## 布局预设与效率验收（002）
 
-- **布局预设**（`rcs_demo/layouts/*.json`，`--layout` 切换、重启生效）：
+- **布局预设**（`agv_dispatch_sim/layouts/*.json`，`--layout` 切换、重启生效）：
   - `baseline`：001 现状（2 格宽环场、双向通道、10 桩）
   - `wide-oneway`：环场主干道加宽至 3 格 + 货架南北缘局部单向段（有平行替代通路，无锁死陷阱）
   - `charge-expanded`：充电桩 16 + 充电区东扩（缓解充电排队拥塞）
@@ -138,9 +158,9 @@ docker exec -it rcs_core_dev \
 ## 目录结构
 
 ```text
-rcs_demo/
+agv_dispatch_sim/
 ├── __main__.py            # 入口（--check/--layout/--port/--seed/--fast）
-├── config.py              # 全量可调参数（RCS_* env 覆盖 + 矛盾组合校验）
+├── config.py              # 全量可调参数（AGV_* env 覆盖 + 矛盾组合校验）
 ├── layouts/               # 布局预设 JSON（baseline / wide-oneway / charge-expanded）
 ├── analyze_conflicts.py   # 冲突事件批次分析 CLI
 ├── sim/
@@ -153,3 +173,9 @@ rcs_demo/
 ├── api/routes.py          # REST + WebSocket + 静态托管
 └── static/                # 前端（原生 HTML/CSS/JS，三层 Canvas）
 ```
+
+## 许可证（License）
+
+本项目采用 [CC BY-NC 4.0](./LICENSE)（署名-非商业性使用 4.0 国际）许可协议：
+**可自由用于个人学习、研究与开源项目，禁止任何商业用途**。
+English users: see [README.en.md](./README.en.md) for the English documentation.
